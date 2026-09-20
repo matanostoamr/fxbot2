@@ -1059,7 +1059,9 @@ bool SubmitRequest(MqlTradeRequest &request, const string label, const bool chec
          PrintFormat("%s OrderCheck transport failure: %d", label, GetLastError());
          return false;
       }
-      if(check.retcode != TRADE_RETCODE_DONE && check.retcode != TRADE_RETCODE_PLACED)
+      if(check.retcode != 0 &&
+         check.retcode != TRADE_RETCODE_DONE &&
+         check.retcode != TRADE_RETCODE_PLACED)
       {
          PrintFormat("%s OrderCheck rejected: %u %s", label, check.retcode, check.comment);
          return false;
