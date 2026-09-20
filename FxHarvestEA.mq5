@@ -1,12 +1,13 @@
 #property copyright "Copyright 2026"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
-#property description "Dual-sided EURUSD harvesting EA with current-market adaptive brakes"
+#property description "Dual-sided EURUSD harvester with spatial brake hysteresis and friction cap"
 
 #define EA_TAG              "FX2"
 #define MAX_OWNED_POSITIONS 8
 #define MAX_OWNED_ORDERS    8
 #define MAX_TICK_SAMPLES    1024
+#define MAX_TELEMETRY_POSITIONS 128
 
 input long   InpMagic                         = 26092026;
 input double InpLots                          = 0.02;
@@ -14,6 +15,9 @@ input double InpTakeProfitPips                = 2.5;
 input double InpAnchorServerStopPips          = 50.0;
 input double InpBrakeOffsetPips               = 1.0;
 input double InpBrakeSoftReleasePips          = 1.0;
+input double InpBrakeRearmAdvancePips         = 2.0;
+input uint   InpMaxSoftReleasesPerCycle       = 2;
+input double InpMaxBrakeRealizedLossGBP       = 0.75;
 input uint   InpBrakeDeadlineMs                = 250;
 input uint   InpIntentTimeoutMs                 = 10000;
 input uint   InpUnknownIntentQuarantineMs       = 30000;
@@ -29,6 +33,7 @@ input double InpUnlinkedChargeReserveGBP       = 0.10;
 input uint   InpMaximumAnchorAgeMinutes       = 360;
 input uint   InpNoNewRiskBeforeCloseMinutes   = 90;
 input uint   InpFridayFlattenMinutes           = 60;
+input uint   InpFridayEscalationSeconds        = 30;
 input uint   InpTripleSwapFlattenMinutes      = 30;
 input int    InpTripleSwapRolloverHour        = 0;
 input int    InpTripleSwapRolloverMinute      = 0;
@@ -39,6 +44,8 @@ input uint   InpEntryQuoteMaxAgeMs            = 1000;
 input uint   InpMaxDeviationPoints            = 20;
 input uint   InpTimerPeriodMs                  = 50;
 input uint   InpLeaseStaleSeconds              = 15;
+input bool   InpTelemetryEnabled               = true;
+input string InpTelemetryFilePrefix            = "FxHarvestEA";
 
 // The engine deliberately uses synchronous OrderSend calls and then reconciles
 // broker inventory. Request acceptance is never treated as fill confirmation.
@@ -74,7 +81,8 @@ enum ResolveReason
    RESOLVE_SOFT_DISTANCE,
    RESOLVE_SOFT_CASH,
    RESOLVE_LEDGER_ESCAPE,
-   RESOLVE_RUNTIME_INVALID
+   RESOLVE_RUNTIME_INVALID,
+   RESOLVE_FRICTION_CAP
 };
 
 enum ProtectionResult
@@ -103,7 +111,8 @@ enum IntentOperation
    INTENT_CLOSE_POSITION,
    INTENT_CLOSE_BY,
    INTENT_DELETE_ORDER,
-   INTENT_MODIFY_PROTECTION
+   INTENT_MODIFY_PROTECTION,
+   INTENT_BRAKE_SOFT_RELEASE
 };
 
 enum IntentStatus
@@ -150,6 +159,22 @@ struct TickSample
    long   time_msc;
    double mid;
    double spread_pips;
+};
+
+struct TelemetryPositionStats
+{
+   ulong        identifier;
+   PositionRole role;
+   ulong        generation;
+   double       entry_volume;
+   double       exit_volume;
+   double       gross_profit;
+   double       commission;
+   double       swap;
+   double       fee;
+   bool         has_tp;
+   bool         soft_released;
+   bool         fallback_entry;
 };
 
 PositionRecord g_positions[MAX_OWNED_POSITIONS];
@@ -222,6 +247,41 @@ datetime      g_tomb_expires              = 0;
 double        g_lease_token               = 0.0;
 string        g_lease_owner_key           = "";
 string        g_lease_heartbeat_key       = "";
+
+// Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
+// from owned deal history where possible, so terminal restarts neither reset
+// the friction budget nor double-count completed events.
+double        g_brake_trigger_watermark   = 0.0;
+uint          g_soft_release_count        = 0;
+double        g_brake_realized_loss_gbp   = 0.0;
+uint          g_initial_tp_count          = 0;
+uint          g_brake_fill_count          = 0;
+uint          g_brake_tp_count            = 0;
+uint          g_fallback_fill_count       = 0;
+uint          g_close_by_count            = 0;
+uint          g_cycle_deal_count          = 0;
+double        g_cycle_gross_profit        = 0.0;
+double        g_cycle_commission          = 0.0;
+double        g_cycle_swap                = 0.0;
+double        g_cycle_fee                 = 0.0;
+double        g_cycle_max_adverse_pips    = 0.0;
+
+datetime      g_resolution_latch_time     = 0;
+datetime      g_friday_flatten_started    = 0;
+bool          g_friday_escalation_logged  = false;
+bool          g_resolution_logged         = false;
+bool          g_completion_logged         = false;
+double        g_latch_liquidation          = 0.0;
+double        g_latch_realized             = 0.0;
+double        g_latch_floating             = 0.0;
+double        g_latch_exit_commission      = 0.0;
+double        g_latch_reserves             = 0.0;
+double        g_latch_anchor_adverse       = 0.0;
+long          g_latch_anchor_age_seconds   = 0;
+double        g_latch_spread_pips          = 0.0;
+int           g_latch_position_count       = 0;
+int           g_latch_order_count          = 0;
+CyclePhase    g_latch_phase                = PHASE_FLAT;
 
 string        g_global_prefix               = "";
 
@@ -401,6 +461,38 @@ void PersistState()
    GlobalVariableSet(StateKey("tomb_role"),       (double)g_tomb_role);
    GlobalVariableSet(StateKey("tomb_volume"),     g_tomb_expected_volume);
    GlobalVariableSet(StateKey("tomb_expires"),    (double)g_tomb_expires);
+
+   GlobalVariableSet(StateKey("brake_watermark"), g_brake_trigger_watermark);
+   GlobalVariableSet(StateKey("soft_release_n"),  (double)g_soft_release_count);
+   GlobalVariableSet(StateKey("brake_loss"),      g_brake_realized_loss_gbp);
+   GlobalVariableSet(StateKey("initial_tp_n"),    (double)g_initial_tp_count);
+   GlobalVariableSet(StateKey("brake_fill_n"),   (double)g_brake_fill_count);
+   GlobalVariableSet(StateKey("brake_tp_n"),     (double)g_brake_tp_count);
+   GlobalVariableSet(StateKey("fallback_fill_n"),(double)g_fallback_fill_count);
+   GlobalVariableSet(StateKey("close_by_n"),     (double)g_close_by_count);
+   GlobalVariableSet(StateKey("cycle_deal_n"),   (double)g_cycle_deal_count);
+   GlobalVariableSet(StateKey("cycle_gross"),    g_cycle_gross_profit);
+   GlobalVariableSet(StateKey("cycle_comm"),     g_cycle_commission);
+   GlobalVariableSet(StateKey("cycle_swap"),     g_cycle_swap);
+   GlobalVariableSet(StateKey("cycle_fee"),      g_cycle_fee);
+   GlobalVariableSet(StateKey("max_adverse"),    g_cycle_max_adverse_pips);
+
+   GlobalVariableSet(StateKey("resolve_time"),   (double)g_resolution_latch_time);
+   GlobalVariableSet(StateKey("friday_start"),   (double)g_friday_flatten_started);
+   GlobalVariableSet(StateKey("friday_alert"),   (g_friday_escalation_logged ? 1.0 : 0.0));
+   GlobalVariableSet(StateKey("resolve_logged"), (g_resolution_logged ? 1.0 : 0.0));
+   GlobalVariableSet(StateKey("complete_logged"),(g_completion_logged ? 1.0 : 0.0));
+   GlobalVariableSet(StateKey("latch_liq"),      g_latch_liquidation);
+   GlobalVariableSet(StateKey("latch_realized"), g_latch_realized);
+   GlobalVariableSet(StateKey("latch_float"),    g_latch_floating);
+   GlobalVariableSet(StateKey("latch_exit_comm"),g_latch_exit_commission);
+   GlobalVariableSet(StateKey("latch_reserves"), g_latch_reserves);
+   GlobalVariableSet(StateKey("latch_adverse"),  g_latch_anchor_adverse);
+   GlobalVariableSet(StateKey("latch_age"),      (double)g_latch_anchor_age_seconds);
+   GlobalVariableSet(StateKey("latch_spread"),   g_latch_spread_pips);
+   GlobalVariableSet(StateKey("latch_positions"),(double)g_latch_position_count);
+   GlobalVariableSet(StateKey("latch_orders"),   (double)g_latch_order_count);
+   GlobalVariableSet(StateKey("latch_phase"),    (double)g_latch_phase);
    GlobalVariablesFlush();
 }
 
@@ -479,6 +571,68 @@ void LoadState()
    g_tomb_cycle = LoadUlong("tomb_cycle");
    g_tomb_generation = LoadUlong("tomb_gen");
    g_tomb_order_ticket = LoadUlong("tomb_order");
+
+   if(GlobalVariableCheck(StateKey("brake_watermark")))
+      g_brake_trigger_watermark = GlobalVariableGet(StateKey("brake_watermark"));
+   if(GlobalVariableCheck(StateKey("soft_release_n")))
+      g_soft_release_count = (uint)GlobalVariableGet(StateKey("soft_release_n"));
+   if(GlobalVariableCheck(StateKey("brake_loss")))
+      g_brake_realized_loss_gbp = GlobalVariableGet(StateKey("brake_loss"));
+   if(GlobalVariableCheck(StateKey("initial_tp_n")))
+      g_initial_tp_count = (uint)GlobalVariableGet(StateKey("initial_tp_n"));
+   if(GlobalVariableCheck(StateKey("brake_fill_n")))
+      g_brake_fill_count = (uint)GlobalVariableGet(StateKey("brake_fill_n"));
+   if(GlobalVariableCheck(StateKey("brake_tp_n")))
+      g_brake_tp_count = (uint)GlobalVariableGet(StateKey("brake_tp_n"));
+   if(GlobalVariableCheck(StateKey("fallback_fill_n")))
+      g_fallback_fill_count = (uint)GlobalVariableGet(StateKey("fallback_fill_n"));
+   if(GlobalVariableCheck(StateKey("close_by_n")))
+      g_close_by_count = (uint)GlobalVariableGet(StateKey("close_by_n"));
+   if(GlobalVariableCheck(StateKey("cycle_deal_n")))
+      g_cycle_deal_count = (uint)GlobalVariableGet(StateKey("cycle_deal_n"));
+   if(GlobalVariableCheck(StateKey("cycle_gross")))
+      g_cycle_gross_profit = GlobalVariableGet(StateKey("cycle_gross"));
+   if(GlobalVariableCheck(StateKey("cycle_comm")))
+      g_cycle_commission = GlobalVariableGet(StateKey("cycle_comm"));
+   if(GlobalVariableCheck(StateKey("cycle_swap")))
+      g_cycle_swap = GlobalVariableGet(StateKey("cycle_swap"));
+   if(GlobalVariableCheck(StateKey("cycle_fee")))
+      g_cycle_fee = GlobalVariableGet(StateKey("cycle_fee"));
+   if(GlobalVariableCheck(StateKey("max_adverse")))
+      g_cycle_max_adverse_pips = GlobalVariableGet(StateKey("max_adverse"));
+
+   if(GlobalVariableCheck(StateKey("resolve_time")))
+      g_resolution_latch_time = (datetime)GlobalVariableGet(StateKey("resolve_time"));
+   if(GlobalVariableCheck(StateKey("friday_start")))
+      g_friday_flatten_started = (datetime)GlobalVariableGet(StateKey("friday_start"));
+   if(GlobalVariableCheck(StateKey("friday_alert")))
+      g_friday_escalation_logged = (GlobalVariableGet(StateKey("friday_alert")) > 0.5);
+   if(GlobalVariableCheck(StateKey("resolve_logged")))
+      g_resolution_logged = (GlobalVariableGet(StateKey("resolve_logged")) > 0.5);
+   if(GlobalVariableCheck(StateKey("complete_logged")))
+      g_completion_logged = (GlobalVariableGet(StateKey("complete_logged")) > 0.5);
+   if(GlobalVariableCheck(StateKey("latch_liq")))
+      g_latch_liquidation = GlobalVariableGet(StateKey("latch_liq"));
+   if(GlobalVariableCheck(StateKey("latch_realized")))
+      g_latch_realized = GlobalVariableGet(StateKey("latch_realized"));
+   if(GlobalVariableCheck(StateKey("latch_float")))
+      g_latch_floating = GlobalVariableGet(StateKey("latch_float"));
+   if(GlobalVariableCheck(StateKey("latch_exit_comm")))
+      g_latch_exit_commission = GlobalVariableGet(StateKey("latch_exit_comm"));
+   if(GlobalVariableCheck(StateKey("latch_reserves")))
+      g_latch_reserves = GlobalVariableGet(StateKey("latch_reserves"));
+   if(GlobalVariableCheck(StateKey("latch_adverse")))
+      g_latch_anchor_adverse = GlobalVariableGet(StateKey("latch_adverse"));
+   if(GlobalVariableCheck(StateKey("latch_age")))
+      g_latch_anchor_age_seconds = (long)GlobalVariableGet(StateKey("latch_age"));
+   if(GlobalVariableCheck(StateKey("latch_spread")))
+      g_latch_spread_pips = GlobalVariableGet(StateKey("latch_spread"));
+   if(GlobalVariableCheck(StateKey("latch_positions")))
+      g_latch_position_count = (int)GlobalVariableGet(StateKey("latch_positions"));
+   if(GlobalVariableCheck(StateKey("latch_orders")))
+      g_latch_order_count = (int)GlobalVariableGet(StateKey("latch_orders"));
+   if(GlobalVariableCheck(StateKey("latch_phase")))
+      g_latch_phase = (CyclePhase)(int)GlobalVariableGet(StateKey("latch_phase"));
 }
 
 bool HasTimedOutTombstone()
@@ -538,6 +692,36 @@ void ClearCycleState()
    g_arming_first_order      = 0;
    g_arming_second_order     = 0;
    g_quarantine_until        = 0;
+   g_brake_trigger_watermark = 0.0;
+   g_soft_release_count      = 0;
+   g_brake_realized_loss_gbp = 0.0;
+   g_initial_tp_count        = 0;
+   g_brake_fill_count        = 0;
+   g_brake_tp_count          = 0;
+   g_fallback_fill_count     = 0;
+   g_close_by_count          = 0;
+   g_cycle_deal_count        = 0;
+   g_cycle_gross_profit      = 0.0;
+   g_cycle_commission        = 0.0;
+   g_cycle_swap              = 0.0;
+   g_cycle_fee               = 0.0;
+   g_cycle_max_adverse_pips  = 0.0;
+   g_resolution_latch_time   = 0;
+   g_friday_flatten_started  = 0;
+   g_friday_escalation_logged = false;
+   g_resolution_logged       = false;
+   g_completion_logged       = false;
+   g_latch_liquidation       = 0.0;
+   g_latch_realized          = 0.0;
+   g_latch_floating          = 0.0;
+   g_latch_exit_commission   = 0.0;
+   g_latch_reserves          = 0.0;
+   g_latch_anchor_adverse    = 0.0;
+   g_latch_anchor_age_seconds = 0;
+   g_latch_spread_pips       = 0.0;
+   g_latch_position_count    = 0;
+   g_latch_order_count       = 0;
+   g_latch_phase             = PHASE_FLAT;
    PersistState();
 }
 
@@ -786,6 +970,31 @@ int FindBrakeOrderIndex()
    return -1;
 }
 
+void UpdateBrakeWatermarkFromSnapshot()
+{
+   bool changed = false;
+   for(int index = 0; index < g_order_count; ++index)
+   {
+      const OrderRecord order = g_orders[index];
+      if(order.role != ROLE_BRAKE || order.open_price <= 0.0)
+         continue;
+      if(order.type == ORDER_TYPE_BUY_STOP &&
+         (g_brake_trigger_watermark == 0.0 || order.open_price > g_brake_trigger_watermark))
+      {
+         g_brake_trigger_watermark = order.open_price;
+         changed = true;
+      }
+      else if(order.type == ORDER_TYPE_SELL_STOP &&
+              (g_brake_trigger_watermark == 0.0 || order.open_price < g_brake_trigger_watermark))
+      {
+         g_brake_trigger_watermark = order.open_price;
+         changed = true;
+      }
+   }
+   if(changed)
+      PersistState();
+}
+
 double BrakePositionVolume()
 {
    double volume = 0.0;
@@ -959,6 +1168,357 @@ bool RealizedCycleNet(double &realized, bool &tp_harvest_found)
          tp_harvest_found = true;
    }
    return true;
+}
+
+string ResolveReasonName(const ResolveReason reason)
+{
+   if(reason == RESOLVE_HARD_BUDGET)    return "RESOLVE_HARD_BUDGET";
+   if(reason == RESOLVE_FRIDAY)         return "RESOLVE_FRIDAY";
+   if(reason == RESOLVE_TRIPLE_SWAP)    return "RESOLVE_TRIPLE_SWAP";
+   if(reason == RESOLVE_MAX_AGE)        return "RESOLVE_MAX_AGE";
+   if(reason == RESOLVE_INVARIANT)      return "RESOLVE_INVARIANT";
+   if(reason == RESOLVE_SOFT_DISTANCE)  return "RESOLVE_SOFT_DISTANCE";
+   if(reason == RESOLVE_SOFT_CASH)      return "RESOLVE_SOFT_CASH";
+   if(reason == RESOLVE_LEDGER_ESCAPE)  return "RESOLVE_LEDGER_ESCAPE";
+   if(reason == RESOLVE_RUNTIME_INVALID)return "RESOLVE_RUNTIME_INVALID";
+   if(reason == RESOLVE_FRICTION_CAP)   return "RESOLVE_FRICTION_CAP";
+   return "RESOLVE_NONE";
+}
+
+string CyclePhaseName(const CyclePhase phase)
+{
+   if(phase == PHASE_FLAT)          return "FLAT";
+   if(phase == PHASE_ARMING)        return "ARMING";
+   if(phase == PHASE_DUAL)          return "DUAL";
+   if(phase == PHASE_ANCHOR)        return "ANCHOR";
+   if(phase == PHASE_BRAKE_PENDING) return "BRAKE_PENDING";
+   if(phase == PHASE_BRAKED)        return "BRAKED";
+   if(phase == PHASE_FLATTENING)    return "FLATTENING";
+   return "INVALID";
+}
+
+bool CommentActionForCycle(const string comment, string &action)
+{
+   action = "";
+   if(g_cycle_id == 0)
+      return false;
+   const string prefix = StringFormat("%s|%I64u|", EA_TAG, g_cycle_id);
+   if(StringFind(comment, prefix) != 0)
+      return false;
+   const int start = StringLen(prefix);
+   const int separator = StringFind(comment, "|", start);
+   action = (separator < 0 ? StringSubstr(comment, start)
+                           : StringSubstr(comment, start, separator - start));
+   return (action != "");
+}
+
+bool DealRoleForCycle(const ulong deal, PositionRole &role, ulong &generation,
+                      bool &fallback_entry)
+{
+   role = ROLE_UNKNOWN;
+   generation = 0;
+   fallback_entry = false;
+
+   ulong cycle = 0;
+   role = ParseIntentCommentEx(HistoryDealGetString(deal, DEAL_COMMENT), cycle, generation);
+   const ulong order = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+   ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY;
+   if(order != 0 && HistoryOrderSelect(order))
+   {
+      ulong order_cycle = 0;
+      ulong order_generation = 0;
+      const PositionRole order_role = ParseIntentCommentEx(HistoryOrderGetString(order, ORDER_COMMENT),
+                                                            order_cycle, order_generation);
+      if(role == ROLE_UNKNOWN && order_cycle == g_cycle_id)
+      {
+         role = order_role;
+         generation = order_generation;
+         cycle = order_cycle;
+      }
+      order_type = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(order, ORDER_TYPE);
+   }
+   if(cycle != g_cycle_id || role == ROLE_UNKNOWN)
+      return false;
+   fallback_entry = (role == ROLE_BRAKE &&
+                     (order_type == ORDER_TYPE_BUY || order_type == ORDER_TYPE_SELL));
+   return true;
+}
+
+int FindTelemetryPosition(const ulong identifier, const TelemetryPositionStats &stats[],
+                          const int count)
+{
+   for(int index = 0; index < count; ++index)
+      if(stats[index].identifier == identifier)
+         return index;
+   return -1;
+}
+
+bool RebuildCycleTelemetry()
+{
+   if(g_cycle_id == 0 || g_cycle_start <= 0)
+      return true;
+   if(!HistorySelect(g_cycle_start - 300, TimeTradeServer() + 60))
+      return false;
+
+   TelemetryPositionStats stats[];
+   int stat_count = 0;
+   const int deal_total = HistoryDealsTotal();
+
+   // Pass 1 establishes owned position identifiers only from this cycle's
+   // initial/brake entry comments (including market-fallback generations).
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_IN && entry != DEAL_ENTRY_INOUT)
+         continue;
+      const ulong identifier = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(identifier == 0 || FindTelemetryPosition(identifier, stats, stat_count) >= 0)
+         continue;
+
+      PositionRole role = ROLE_UNKNOWN;
+      ulong generation = 0;
+      bool fallback_entry = false;
+      if(!DealRoleForCycle(deal, role, generation, fallback_entry))
+         continue;
+
+      TelemetryPositionStats record;
+      ZeroMemory(record);
+      record.identifier = identifier;
+      record.role = role;
+      record.generation = generation;
+      record.fallback_entry = fallback_entry;
+      ArrayResize(stats, stat_count + 1);
+      stats[stat_count++] = record;
+   }
+
+   ulong close_by_orders[];
+   int close_by_order_count = 0;
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      const ulong identifier = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      const int stat_index = FindTelemetryPosition(identifier, stats, stat_count);
+      if(stat_index < 0)
+         continue;
+
+      TelemetryPositionStats record = stats[stat_index];
+      const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      const ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
+      const double volume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+      if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
+         record.entry_volume += volume;
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+      {
+         record.exit_volume += volume;
+         if(reason == DEAL_REASON_TP)
+            record.has_tp = true;
+
+         const ulong order = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+         if(order != 0 && HistoryOrderSelect(order))
+         {
+            string action = "";
+            if(CommentActionForCycle(HistoryOrderGetString(order, ORDER_COMMENT), action))
+            {
+               if(action == "SR")
+                  record.soft_released = true;
+               if(action == "CB")
+                  AddUniqueOrderId(order, close_by_orders, close_by_order_count);
+            }
+         }
+      }
+      record.gross_profit += HistoryDealGetDouble(deal, DEAL_PROFIT);
+      record.commission += HistoryDealGetDouble(deal, DEAL_COMMISSION);
+      record.swap += HistoryDealGetDouble(deal, DEAL_SWAP);
+      record.fee += HistoryDealGetDouble(deal, DEAL_FEE);
+      stats[stat_index] = record;
+   }
+
+   uint initial_tps = 0;
+   uint brake_fills = 0;
+   uint brake_tps = 0;
+   uint soft_releases = 0;
+   uint fallback_fills = 0;
+   uint deal_count = 0;
+   double brake_loss = 0.0;
+   double gross = 0.0;
+   double commission = 0.0;
+   double swap = 0.0;
+   double fee = 0.0;
+
+   for(int index = 0; index < stat_count; ++index)
+   {
+      const TelemetryPositionStats record = stats[index];
+      gross += record.gross_profit;
+      commission += record.commission;
+      swap += record.swap;
+      fee += record.fee;
+      if(record.role == ROLE_BRAKE && record.entry_volume > VolumeTolerance())
+      {
+         ++brake_fills;
+         if(record.fallback_entry)
+            ++fallback_fills;
+      }
+      if(record.has_tp)
+      {
+         if(record.role == ROLE_BRAKE)
+            ++brake_tps;
+         else
+            ++initial_tps;
+      }
+      if(record.role == ROLE_BRAKE && record.soft_released &&
+         record.exit_volume + VolumeTolerance() >= record.entry_volume)
+      {
+         ++soft_releases;
+         const double net = record.gross_profit + record.commission + record.swap + record.fee;
+         if(net < 0.0)
+            brake_loss += -net; // profitable brakes never buy more churn allowance
+      }
+   }
+
+   // Count every owned deal exactly once by ticket. Position ownership prevents
+   // the foreign side of a CLOSE_BY order from spilling into this cycle.
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      const ulong identifier = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(FindTelemetryPosition(identifier, stats, stat_count) >= 0)
+         ++deal_count;
+   }
+
+   g_initial_tp_count = initial_tps;
+   g_brake_fill_count = brake_fills;
+   g_brake_tp_count = brake_tps;
+   g_soft_release_count = soft_releases;
+   g_fallback_fill_count = fallback_fills;
+   g_close_by_count = (uint)close_by_order_count;
+   g_cycle_deal_count = deal_count;
+   g_brake_realized_loss_gbp = brake_loss;
+   g_cycle_gross_profit = gross;
+   g_cycle_commission = commission;
+   g_cycle_swap = swap;
+   g_cycle_fee = fee;
+   return true;
+}
+
+string TelemetryFileName()
+{
+   return StringFormat("%s_%I64d_%s_%I64d_cycles.csv", InpTelemetryFilePrefix,
+                       AccountInfoInteger(ACCOUNT_LOGIN), _Symbol, InpMagic);
+}
+
+bool OpenTelemetryFile(int &handle)
+{
+   handle = FileOpen(TelemetryFileName(), FILE_READ | FILE_WRITE | FILE_CSV |
+                     FILE_ANSI | FILE_COMMON | FILE_SHARE_READ, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      PrintFormat("Telemetry FileOpen failed: %s error=%d", TelemetryFileName(), GetLastError());
+      return false;
+   }
+   if(FileSize(handle) == 0)
+   {
+      FileWrite(handle, "schema", "event_id", "event", "time", "cycle_id", "reason", "phase",
+                "cycle_start", "cycle_end", "duration_seconds", "liquidation_at_latch",
+                "final_net", "gross_profit", "commission", "swap", "fee", "exit_overshoot",
+                "realized_at_latch", "floating_at_latch", "exit_commission_at_latch",
+                "reserves_at_latch", "anchor_adverse_at_latch", "anchor_age_seconds",
+                "max_adverse_pips", "positions_at_latch", "orders_at_latch", "deal_count",
+                "initial_tps", "brake_fills", "brake_tps", "soft_releases",
+                "brake_realized_loss", "fallback_fills", "close_by_count", "spread_at_latch",
+                "brake_watermark");
+   }
+   FileSeek(handle, 0, SEEK_END);
+   return true;
+}
+
+bool WriteTelemetryEvent(const string event_name, const datetime event_time,
+                         const bool completed)
+{
+   if(!InpTelemetryEnabled)
+      return true;
+
+   int handle = INVALID_HANDLE;
+   if(!OpenTelemetryFile(handle))
+      return false;
+
+   const string event_id = StringFormat("%I64u-%s", g_cycle_id, event_name);
+   const double final_net = g_cycle_gross_profit + g_cycle_commission + g_cycle_swap + g_cycle_fee;
+   const long duration = (g_cycle_start > 0 ? (long)(event_time - g_cycle_start) : 0);
+   const double overshoot = (completed ? final_net - g_latch_liquidation : 0.0);
+   const uint written = FileWrite(handle, "FX2-CYCLE-V2", event_id, event_name,
+                                  TimeToString(event_time, TIME_DATE | TIME_SECONDS), g_cycle_id,
+                                  ResolveReasonName(g_resolve_reason), CyclePhaseName(g_latch_phase),
+                                  TimeToString(g_cycle_start, TIME_DATE | TIME_SECONDS),
+                                  (completed ? TimeToString(event_time, TIME_DATE | TIME_SECONDS) : ""),
+                                  duration, g_latch_liquidation,
+                                  (completed ? DoubleToString(final_net, 2) : ""),
+                                  g_cycle_gross_profit, g_cycle_commission, g_cycle_swap, g_cycle_fee,
+                                  (completed ? DoubleToString(overshoot, 2) : ""),
+                                  g_latch_realized, g_latch_floating, g_latch_exit_commission,
+                                  g_latch_reserves, g_latch_anchor_adverse,
+                                  g_latch_anchor_age_seconds, g_cycle_max_adverse_pips,
+                                  g_latch_position_count, g_latch_order_count, g_cycle_deal_count,
+                                  g_initial_tp_count, g_brake_fill_count, g_brake_tp_count,
+                                  g_soft_release_count, g_brake_realized_loss_gbp,
+                                  g_fallback_fill_count, g_close_by_count, g_latch_spread_pips,
+                                  g_brake_trigger_watermark);
+   FileFlush(handle);
+   FileClose(handle);
+   return (written > 0);
+}
+
+void CaptureResolutionTelemetry()
+{
+   bool tp_found = false;
+   g_latch_realized = 0.0;
+   RealizedCycleNet(g_latch_realized, tp_found);
+   g_latch_floating = 0.0;
+   for(int index = 0; index < g_position_count; ++index)
+      g_latch_floating += g_positions[index].profit + g_positions[index].swap;
+   g_latch_exit_commission = ExitCommissionEstimate();
+   g_latch_reserves = InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP;
+   g_latch_liquidation = g_latch_realized + g_latch_floating -
+                         g_latch_exit_commission - g_latch_reserves;
+   g_latch_anchor_adverse = AnchorAdversePips();
+   g_latch_anchor_age_seconds = (g_anchor_since > 0
+                                 ? (long)(TimeTradeServer() - g_anchor_since) : 0);
+   g_latch_spread_pips = (g_last_tick.ask > g_last_tick.bid
+                          ? (g_last_tick.ask - g_last_tick.bid) / PipSize() : 0.0);
+   g_latch_position_count = g_position_count;
+   g_latch_order_count = g_order_count;
+   g_latch_phase = g_phase;
+   g_resolution_latch_time = TimeTradeServer();
+}
+
+void LogResolutionTelemetry()
+{
+   if(g_resolution_logged)
+      return;
+   RebuildCycleTelemetry();
+   if(WriteTelemetryEvent("RESOLUTION_LATCH", g_resolution_latch_time, false))
+   {
+      g_resolution_logged = true;
+      PersistState();
+   }
+}
+
+void LogCycleCompletionTelemetry()
+{
+   if(g_completion_logged || g_cycle_id == 0)
+      return;
+   RebuildCycleTelemetry();
+   if(WriteTelemetryEvent("CYCLE_COMPLETE", TimeTradeServer(), true))
+   {
+      g_completion_logged = true;
+      PersistState();
+   }
 }
 
 double ExitCommissionEstimate()
@@ -1163,7 +1723,14 @@ bool SendBrakeStop(const int anchor_index)
    const double missing_volume = NormalizeVolumeDown(anchor.volume - BrakePositionVolume());
    if(missing_volume <= VolumeTolerance())
       return true;
-   const double raw_price = (need_buy ? tick.ask + effective_h * pip : tick.bid - effective_h * pip);
+   double raw_price = (need_buy ? tick.ask + effective_h * pip : tick.bid - effective_h * pip);
+   if(g_brake_trigger_watermark > 0.0)
+   {
+      const double watermark_rearm = g_brake_trigger_watermark +
+                                      (need_buy ? 1.0 : -1.0) * InpBrakeRearmAdvancePips * pip;
+      raw_price = (need_buy ? MathMax(raw_price, watermark_rearm)
+                            : MathMin(raw_price, watermark_rearm));
+   }
    const double stop_price = (need_buy ? NormalizePriceUp(raw_price) : NormalizePriceDown(raw_price));
 
    MqlTradeRequest request;
@@ -1188,6 +1755,9 @@ bool SendBrakeStop(const int anchor_index)
       g_brake_cross_tick_msc = 0;
       g_brake_cross_local_msc = 0;
       g_fallback_stage = FALLBACK_NONE;
+      // The broker-visible order snapshot may later refine this requested
+      // trigger. It can only move monotonically adverse for the anchor episode.
+      g_brake_trigger_watermark = stop_price;
       PersistState();
    }
    return accepted;
@@ -1240,7 +1810,9 @@ bool DeleteOrderTicket(const ulong ticket, const string label,
    return SubmitRequest(request, label, false, operation);
 }
 
-bool ClosePositionTicket(const PositionRecord &position, const string label)
+bool ClosePositionTicket(const PositionRecord &position, const string label,
+                         const IntentOperation operation = INTENT_CLOSE_POSITION,
+                         const string action_code = "CL")
 {
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
@@ -1258,8 +1830,8 @@ bool ClosePositionTicket(const PositionRecord &position, const string label)
    request.price        = (closing_buy ? tick.ask : tick.bid);
    request.deviation    = InpMaxDeviationPoints;
    request.type_filling = MarketFillingMode();
-   request.comment      = StringFormat("%s|%I64u|CL", EA_TAG, g_cycle_id);
-   return SubmitRequest(request, label, true, INTENT_CLOSE_POSITION);
+   request.comment      = StringFormat("%s|%I64u|%s", EA_TAG, g_cycle_id, action_code);
+   return SubmitRequest(request, label, true, operation);
 }
 
 bool CloseByTickets(const PositionRecord &first, const PositionRecord &second)
@@ -1524,6 +2096,24 @@ double AnchorAdversePips()
    return MathMax(0.0, (g_last_tick.ask - anchor.open_price) / PipSize());
 }
 
+void UpdateCyclePathTelemetry()
+{
+   if(g_cycle_id == 0)
+      return;
+   const double adverse = AnchorAdversePips();
+   if(adverse > g_cycle_max_adverse_pips)
+      g_cycle_max_adverse_pips = adverse;
+   RebuildCycleTelemetry();
+}
+
+bool FrictionCapReached()
+{
+   return ((InpMaxSoftReleasesPerCycle > 0 &&
+            g_soft_release_count >= InpMaxSoftReleasesPerCycle) ||
+           (InpMaxBrakeRealizedLossGBP > 0.0 &&
+            g_brake_realized_loss_gbp + 1.0e-8 >= InpMaxBrakeRealizedLossGBP));
+}
+
 bool MaximumAnchorAgeReached()
 {
    return (g_anchor_since > 0 && TimeTradeServer() - g_anchor_since >= (datetime)InpMaximumAnchorAgeMinutes * 60);
@@ -1622,10 +2212,18 @@ void LatchResolution(const ResolveReason reason)
 {
    if(g_resolve_reason == RESOLVE_NONE)
    {
+      const CyclePhase phase_at_latch = g_phase;
       g_resolve_reason = reason;
+      CaptureResolutionTelemetry();
+      g_latch_phase = phase_at_latch;
+      if(reason == RESOLVE_FRIDAY && g_friday_flatten_started == 0)
+         g_friday_flatten_started = TimeTradeServer();
       g_phase = PHASE_FLATTENING;
-      PrintFormat("Cycle %I64u resolution latched: %d", g_cycle_id, (int)reason);
+      PrintFormat("Cycle %I64u resolution latched: %s liquidation=%.2f adverse=%.2f soft_releases=%u brake_loss=%.2f",
+                  g_cycle_id, ResolveReasonName(reason), g_latch_liquidation,
+                  g_latch_anchor_adverse, g_soft_release_count, g_brake_realized_loss_gbp);
       PersistState();
+      LogResolutionTelemetry();
    }
 }
 
@@ -1708,6 +2306,9 @@ bool OrderStateUnfilled(const ENUM_ORDER_STATE state)
 bool FindIntentHistoryOrder(ulong &ticket, ENUM_ORDER_STATE &state)
 {
    ticket = g_intent_order_ticket;
+   if(ticket == 0 &&
+      (g_intent_operation == INTENT_DELETE_ORDER || g_intent_operation == INTENT_BRAKE_CANCEL))
+      ticket = g_intent_target_ticket;
    if(ticket != 0 && HistoryOrderSelect(ticket))
    {
       state = (ENUM_ORDER_STATE)HistoryOrderGetInteger(ticket, ORDER_STATE);
@@ -1995,7 +2596,8 @@ bool ReconcileOutstandingIntent()
          return false;
       }
    }
-   else if(g_intent_operation == INTENT_CLOSE_POSITION)
+   else if(g_intent_operation == INTENT_CLOSE_POSITION ||
+           g_intent_operation == INTENT_BRAKE_SOFT_RELEASE)
    {
       const double current_volume = CurrentPositionVolumeByTicket(g_intent_target_ticket);
       const bool disappeared = (current_volume <= VolumeTolerance());
@@ -2112,6 +2714,7 @@ bool FlattenOneAction()
 
    if(TimeTradeServer() < g_quarantine_until)
       return false;
+   LogCycleCompletionTelemetry();
    ClearCycleState();
    return true;
 }
@@ -2362,7 +2965,8 @@ bool HandleBrakeLifecycle()
       if(g_positions[index].role != ROLE_BRAKE)
          continue;
       if(BrakeSoftReleaseTriggered(g_positions[index]))
-         return ClosePositionTicket(g_positions[index], "Brake one-pip soft release");
+         return ClosePositionTicket(g_positions[index], "Brake one-pip soft release",
+                                    INTENT_BRAKE_SOFT_RELEASE, "SR");
    }
    return false;
 }
@@ -2537,6 +3141,7 @@ void Drive()
    }
 
    RefreshSnapshot();
+   UpdateBrakeWatermarkFromSnapshot();
    ReconcileTimedOutTombstone();
    InferPhase();
    // OrderSend and callbacks. No other action
@@ -2546,6 +3151,7 @@ void Drive()
       g_drive_busy = false;
       return;
    }
+   UpdateCyclePathTelemetry();
 
    const bool active_cycle = (g_position_count > 0 || g_order_count > 0 ||
                               g_cycle_id != 0 || HasOutstandingIntent() || HasTimedOutTombstone() ||
@@ -2556,6 +3162,8 @@ void Drive()
       TimeTradeServer() >= g_quarantine_until &&
       g_phase != PHASE_ARMING && g_resolve_reason == RESOLVE_NONE)
    {
+      RebuildCycleTelemetry();
+      LogCycleCompletionTelemetry();
       ClearCycleState();
       RefreshSnapshot();
    }
@@ -2578,6 +3186,19 @@ void Drive()
 
    if(g_resolve_reason != RESOLVE_NONE)
    {
+      if(g_resolve_reason == RESOLVE_FRIDAY && g_friday_flatten_started > 0 &&
+         !g_friday_escalation_logged &&
+         TimeTradeServer() - g_friday_flatten_started >= (datetime)InpFridayEscalationSeconds &&
+         (g_position_count > 0 || g_order_count > 0 || HasOutstandingIntent() || HasTimedOutTombstone()))
+      {
+         PrintFormat("FRIDAY_FLATTEN_ESCALATION cycle=%I64u elapsed=%d positions=%d orders=%d intent=%s tombstone=%s",
+                     g_cycle_id, (int)(TimeTradeServer() - g_friday_flatten_started),
+                     g_position_count, g_order_count,
+                     (HasOutstandingIntent() ? "true" : "false"),
+                     (HasTimedOutTombstone() ? "true" : "false"));
+         g_friday_escalation_logged = true;
+         PersistState();
+      }
       if(CanReduceRisk())
          FlattenOneAction();
       g_drive_busy = false;
@@ -2642,6 +3263,17 @@ void Drive()
    if(active_cycle && MaximumAnchorAgeReached())
    {
       LatchResolution(RESOLVE_MAX_AGE);
+      FlattenOneAction();
+      g_drive_busy = false;
+      return;
+   }
+
+   // P2.5: completed soft-release churn immediately resolves the entire cycle.
+   // This check precedes all brake maintenance, so no successor brake can be
+   // armed after the count or realized-loss boundary becomes visible.
+   if(active_cycle && FrictionCapReached())
+   {
+      LatchResolution(RESOLVE_FRICTION_CAP);
       FlattenOneAction();
       g_drive_busy = false;
       return;
@@ -2802,11 +3434,14 @@ bool ValidateStaticConfiguration()
       InpEmergencySlippageReserveGBP < 0.0 || InpUnlinkedChargeReserveGBP < 0.0 ||
       InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP >= InpHardCycleLossGBP ||
       InpBrakeOffsetPips <= 0.0 || InpBrakeSoftReleasePips <= 0.0 ||
+      InpBrakeRearmAdvancePips <= 0.0 || InpMaxSoftReleasesPerCycle == 0 ||
+      InpMaxBrakeRealizedLossGBP <= 0.0 || StringLen(InpTelemetryFilePrefix) == 0 ||
       InpBrakeDeadlineMs == 0 || InpIntentTimeoutMs <= InpBrakeDeadlineMs ||
       InpUnknownIntentQuarantineMs < InpIntentTimeoutMs || InpSettlementQuietMs == 0 ||
       InpTimerPeriodMs < 10 || InpTimerPeriodMs > 60000 || InpLeaseStaleSeconds < 5 ||
       InpTimedOutIntentRetentionMinutes == 0 ||
       InpNoNewRiskBeforeCloseMinutes > 1440 || InpFridayFlattenMinutes > 1440 ||
+      InpFridayEscalationSeconds == 0 ||
       InpTripleSwapFlattenMinutes > 1440 ||
       InpTripleSwapRolloverHour < 0 || InpTripleSwapRolloverHour > 23 ||
       InpTripleSwapRolloverMinute < 0 || InpTripleSwapRolloverMinute > 59)
