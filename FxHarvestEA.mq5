@@ -2536,7 +2536,8 @@ void Drive()
 
    RefreshSnapshot();
    ReconcileTimedOutTombstone();
-   InferPhase(); OrderSend and callbacks. No other action
+   InferPhase();
+   // OrderSend and callbacks. No other action
    // may be emitted until the durable single-flight intent is causally settled.
    if(ReconcileOutstandingIntent())
    {
