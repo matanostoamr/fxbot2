@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "1.10"
+#property version   "1.11"
 #property strict
 #property description "Dual-sided EURUSD harvester with spatial brake hysteresis and friction cap"
 
@@ -9,12 +9,24 @@
 #define MAX_TICK_SAMPLES    1024
 #define MAX_TELEMETRY_POSITIONS 128
 
+enum BrakeReleaseReference
+{
+   RELEASE_FROM_FILL = 0,     // validated PR #2 behaviour, spread-dependent
+   RELEASE_FROM_TRIGGER = 1   // spread-independent, strictly wider distance
+};
+
 input long   InpMagic                         = 26092026;
 input double InpLots                          = 0.02;
 input double InpTakeProfitPips                = 2.5;
 input double InpAnchorServerStopPips          = 50.0;
 input double InpBrakeOffsetPips               = 1.0;
 input double InpBrakeSoftReleasePips          = 1.0;
+// RELEASE_FROM_FILL reproduces the validated PR #2 economics: the distance is
+// measured from the brake fill, so the effective adverse market move is
+// (InpBrakeSoftReleasePips - spread). RELEASE_FROM_TRIGGER measures from the
+// stop trigger instead, making the distance spread-independent but strictly
+// wider, which raises the brake TP rate required to break even.
+input BrakeReleaseReference InpBrakeReleaseReference = RELEASE_FROM_FILL;
 input double InpBrakeRearmAdvancePips         = 2.0;
 input uint   InpMaxSoftReleasesPerCycle       = 2;
 input double InpMaxBrakeRealizedLossGBP       = 0.75;
@@ -2942,12 +2954,63 @@ bool HandleArmingCompletion()
    return false;
 }
 
+// Resolves the stop trigger price that created this brake. Market-fallback
+// brakes have no trigger, so the fill price remains the only valid reference.
+bool BrakeStopTriggerPrice(const PositionRecord &brake, double &trigger)
+{
+   trigger = 0.0;
+   if(brake.identifier == 0)
+      return false;
+   const datetime from_time = (g_cycle_start > 0 ? g_cycle_start - 300
+                                                 : TimeTradeServer() - 86400);
+   if(!HistorySelect(from_time, TimeTradeServer() + 60))
+      return false;
+
+   const int deal_total = HistoryDealsTotal();
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != brake.identifier)
+         continue;
+      const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_IN && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      const ulong order = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+      if(order == 0 || !HistoryOrderSelect(order))
+         continue;
+      const ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(order, ORDER_TYPE);
+      if(order_type != ORDER_TYPE_BUY_STOP && order_type != ORDER_TYPE_SELL_STOP)
+         continue;
+      const double price = HistoryOrderGetDouble(order, ORDER_PRICE_OPEN);
+      if(price <= 0.0)
+         continue;
+      trigger = price;
+      return true;
+   }
+   return false;
+}
+
+double BrakeReleaseReferencePrice(const PositionRecord &brake)
+{
+   if(InpBrakeReleaseReference == RELEASE_FROM_TRIGGER)
+   {
+      double trigger = 0.0;
+      if(BrakeStopTriggerPrice(brake, trigger))
+         return trigger;
+   }
+   return brake.open_price;
+}
+
 bool BrakeSoftReleaseTriggered(const PositionRecord &brake)
 {
    const double distance = InpBrakeSoftReleasePips * PipSize();
+   const double reference = BrakeReleaseReferencePrice(brake);
    if(brake.type == POSITION_TYPE_BUY)
-      return (g_last_tick.bid <= brake.open_price - distance);
-   return (g_last_tick.ask >= brake.open_price + distance);
+      return (g_last_tick.bid <= reference - distance);
+   return (g_last_tick.ask >= reference + distance);
 }
 
 bool HandleBrakeLifecycle()
