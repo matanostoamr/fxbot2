@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "1.10"
+#property version   "1.12"
 #property strict
 #property description "Dual-sided EURUSD harvester with spatial brake hysteresis and friction cap"
 
@@ -9,12 +9,24 @@
 #define MAX_TICK_SAMPLES    1024
 #define MAX_TELEMETRY_POSITIONS 128
 
+enum BrakeReleaseReference
+{
+   RELEASE_FROM_FILL = 0,     // validated PR #2 behaviour, spread-dependent
+   RELEASE_FROM_TRIGGER = 1   // spread-independent, strictly wider distance
+};
+
 input long   InpMagic                         = 26092026;
 input double InpLots                          = 0.02;
 input double InpTakeProfitPips                = 2.5;
 input double InpAnchorServerStopPips          = 50.0;
 input double InpBrakeOffsetPips               = 1.0;
 input double InpBrakeSoftReleasePips          = 1.0;
+// RELEASE_FROM_FILL reproduces the validated PR #2 economics: the distance is
+// measured from the brake fill, so the effective adverse market move is
+// (InpBrakeSoftReleasePips - spread). RELEASE_FROM_TRIGGER measures from the
+// stop trigger instead, making the distance spread-independent but strictly
+// wider, which raises the brake TP rate required to break even.
+input BrakeReleaseReference InpBrakeReleaseReference = RELEASE_FROM_FILL;
 input double InpBrakeRearmAdvancePips         = 2.0;
 input uint   InpMaxSoftReleasesPerCycle       = 2;
 input double InpMaxBrakeRealizedLossGBP       = 0.75;
@@ -247,6 +259,13 @@ datetime      g_tomb_expires              = 0;
 double        g_lease_token               = 0.0;
 string        g_lease_owner_key           = "";
 string        g_lease_heartbeat_key       = "";
+
+// Telemetry rebuild throttle and per-run identity. g_run_id lets rows from
+// separate Strategy Tester runs be separated even when they append to one file.
+bool          g_telemetry_dirty           = true;
+int           g_telemetry_last_positions  = -1;
+int           g_telemetry_last_orders     = -1;
+string        g_run_id                    = "";
 
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
@@ -722,6 +741,9 @@ void ClearCycleState()
    g_latch_position_count    = 0;
    g_latch_order_count       = 0;
    g_latch_phase             = PHASE_FLAT;
+   g_telemetry_dirty         = true;
+   g_telemetry_last_positions = -1;
+   g_telemetry_last_orders   = -1;
    PersistState();
 }
 
@@ -1424,7 +1446,7 @@ bool OpenTelemetryFile(int &handle)
    }
    if(FileSize(handle) == 0)
    {
-      FileWrite(handle, "schema", "event_id", "event", "time", "cycle_id", "reason", "phase",
+      FileWrite(handle, "schema", "run_id", "event_id", "event", "time", "cycle_id", "reason", "phase",
                 "cycle_start", "cycle_end", "duration_seconds", "liquidation_at_latch",
                 "final_net", "gross_profit", "commission", "swap", "fee", "exit_overshoot",
                 "realized_at_latch", "floating_at_latch", "exit_commission_at_latch",
@@ -1448,11 +1470,11 @@ bool WriteTelemetryEvent(const string event_name, const datetime event_time,
    if(!OpenTelemetryFile(handle))
       return false;
 
-   const string event_id = StringFormat("%I64u-%s", g_cycle_id, event_name);
+   const string event_id = StringFormat("%s-%I64u-%s", g_run_id, g_cycle_id, event_name);
    const double final_net = g_cycle_gross_profit + g_cycle_commission + g_cycle_swap + g_cycle_fee;
    const long duration = (g_cycle_start > 0 ? (long)(event_time - g_cycle_start) : 0);
    const double overshoot = (completed ? final_net - g_latch_liquidation : 0.0);
-   const uint written = FileWrite(handle, "FX2-CYCLE-V2", event_id, event_name,
+   const uint written = FileWrite(handle, "FX2-CYCLE-V3", g_run_id, event_id, event_name,
                                   TimeToString(event_time, TIME_DATE | TIME_SECONDS), g_cycle_id,
                                   ResolveReasonName(g_resolve_reason), CyclePhaseName(g_latch_phase),
                                   TimeToString(g_cycle_start, TIME_DATE | TIME_SECONDS),
@@ -2100,10 +2122,27 @@ void UpdateCyclePathTelemetry()
 {
    if(g_cycle_id == 0)
       return;
+
+   // Tracking the adverse excursion is cheap and must happen on every tick.
    const double adverse = AnchorAdversePips();
    if(adverse > g_cycle_max_adverse_pips)
       g_cycle_max_adverse_pips = adverse;
-   RebuildCycleTelemetry();
+
+   // Rebuilding from deal history is not cheap and only changes when inventory
+   // changes or a deal arrives. Rescanning on every tick of a month-long run is
+   // pure waste, and the friction counters cannot move without one of those
+   // events, so throttling here is behaviourally identical.
+   if(g_position_count != g_telemetry_last_positions ||
+      g_order_count != g_telemetry_last_orders)
+      g_telemetry_dirty = true;
+   if(!g_telemetry_dirty)
+      return;
+   if(RebuildCycleTelemetry())
+   {
+      g_telemetry_dirty = false;
+      g_telemetry_last_positions = g_position_count;
+      g_telemetry_last_orders = g_order_count;
+   }
 }
 
 bool FrictionCapReached()
@@ -2942,12 +2981,63 @@ bool HandleArmingCompletion()
    return false;
 }
 
+// Resolves the stop trigger price that created this brake. Market-fallback
+// brakes have no trigger, so the fill price remains the only valid reference.
+bool BrakeStopTriggerPrice(const PositionRecord &brake, double &trigger)
+{
+   trigger = 0.0;
+   if(brake.identifier == 0)
+      return false;
+   const datetime from_time = (g_cycle_start > 0 ? g_cycle_start - 300
+                                                 : TimeTradeServer() - 86400);
+   if(!HistorySelect(from_time, TimeTradeServer() + 60))
+      return false;
+
+   const int deal_total = HistoryDealsTotal();
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != brake.identifier)
+         continue;
+      const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_IN && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      const ulong order = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+      if(order == 0 || !HistoryOrderSelect(order))
+         continue;
+      const ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(order, ORDER_TYPE);
+      if(order_type != ORDER_TYPE_BUY_STOP && order_type != ORDER_TYPE_SELL_STOP)
+         continue;
+      const double price = HistoryOrderGetDouble(order, ORDER_PRICE_OPEN);
+      if(price <= 0.0)
+         continue;
+      trigger = price;
+      return true;
+   }
+   return false;
+}
+
+double BrakeReleaseReferencePrice(const PositionRecord &brake)
+{
+   if(InpBrakeReleaseReference == RELEASE_FROM_TRIGGER)
+   {
+      double trigger = 0.0;
+      if(BrakeStopTriggerPrice(brake, trigger))
+         return trigger;
+   }
+   return brake.open_price;
+}
+
 bool BrakeSoftReleaseTriggered(const PositionRecord &brake)
 {
    const double distance = InpBrakeSoftReleasePips * PipSize();
+   const double reference = BrakeReleaseReferencePrice(brake);
    if(brake.type == POSITION_TYPE_BUY)
-      return (g_last_tick.bid <= brake.open_price - distance);
-   return (g_last_tick.ask >= brake.open_price + distance);
+      return (g_last_tick.bid <= reference - distance);
+   return (g_last_tick.ask >= reference + distance);
 }
 
 bool HandleBrakeLifecycle()
@@ -3268,17 +3358,6 @@ void Drive()
       return;
    }
 
-   // P2.5: completed soft-release churn immediately resolves the entire cycle.
-   // This check precedes all brake maintenance, so no successor brake can be
-   // armed after the count or realized-loss boundary becomes visible.
-   if(active_cycle && FrictionCapReached())
-   {
-      LatchResolution(RESOLVE_FRICTION_CAP);
-      FlattenOneAction();
-      g_drive_busy = false;
-      return;
-   }
-
    // P3: protection and arming invariants. Inventory shape was validated
    // before monetary policy so malformed/foreign records cannot contaminate
    // the cycle ledger.
@@ -3331,6 +3410,20 @@ void Drive()
    if(g_harvested && FindAnchorIndex() >= 0 && liquidation >= InpLedgerEscapeTargetGBP)
    {
       LatchResolution(RESOLVE_LEDGER_ESCAPE);
+      FlattenOneAction();
+      g_drive_busy = false;
+      return;
+   }
+
+   // P5.5: completed soft-release churn resolves the whole cycle. This sits
+   // AFTER ledger escape so a cycle that is already at or above the escape
+   // target is attributed to RESOLVE_LEDGER_ESCAPE rather than being mislabelled
+   // as friction churn, and BEFORE all brake maintenance so no successor brake
+   // can be armed once either boundary is visible. Both orderings flatten at
+   // the same price, so cycle P/L is unchanged; only the attribution differs.
+   if(active_cycle && FrictionCapReached())
+   {
+      LatchResolution(RESOLVE_FRICTION_CAP);
       FlattenOneAction();
       g_drive_busy = false;
       return;
@@ -3428,6 +3521,19 @@ bool ValidateStaticConfiguration()
       return false;
    }
 
+   // The flatten window must be nested inside the no-new-risk window. If it is
+   // wider, P2 latches RESOLVE_FRIDAY and flattens, ClearCycleState() clears the
+   // latch, then P8 sees itself outside the narrower no-risk window and arms a
+   // fresh pair, which P2 flattens again -- an arm/flatten loop that burns
+   // commission and spread on every iteration until the session closes.
+   if(InpNoNewRiskBeforeCloseMinutes < InpFridayFlattenMinutes)
+   {
+      PrintFormat("Initialization failed: InpNoNewRiskBeforeCloseMinutes (%u) must be >= "
+                  "InpFridayFlattenMinutes (%u) to prevent Friday arm/flatten cycles.",
+                  InpNoNewRiskBeforeCloseMinutes, InpFridayFlattenMinutes);
+      return false;
+   }
+
    if(InpLots <= 0.0 || InpTakeProfitPips <= 0.0 || InpAnchorServerStopPips <= 0.0 ||
       InpPolicyResetPips <= 0.0 || InpPolicyResetPips >= InpAnchorServerStopPips ||
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
@@ -3462,6 +3568,21 @@ int OnInit()
       Print("Initialization failed: persistence key exceeds terminal limit.");
       return INIT_FAILED;
    }
+
+   // Strategy Tester runs share the terminal's Global Variable space, so state
+   // from a previous run (cycle, watermark, friction counters, and the instance
+   // lease) can leak into the next one. Replaying different date ranges back to
+   // back would then inherit a stale watermark/counter set, and a lease whose
+   // heartbeat sits in another run's simulated time can even fail OnInit. A
+   // backtest must always start from a clean slate; live state is untouched.
+   g_run_id = StringFormat("%s#%I64u", TimeToString(TimeTradeServer(), TIME_DATE),
+                           GetTickCount64() % 100000);
+   if((bool)MQLInfoInteger(MQL_TESTER))
+   {
+      GlobalVariablesDeleteAll(g_global_prefix);
+      PrintFormat("Tester run %s: cleared persisted state for prefix %s", g_run_id, g_global_prefix);
+   }
+
    if(!AcquireInstanceLease())
    {
       Print("Initialization failed: another EA instance owns this account/symbol/magic lease.");
@@ -3569,6 +3690,11 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
          PersistState();
       }
    }
+
+   // A new deal is the only event that can move the friction counters without an
+   // inventory-count change, so it must invalidate the telemetry cache.
+   if(transaction.type == TRADE_TRANSACTION_DEAL_ADD)
+      g_telemetry_dirty = true;
 
    if(transaction.type == TRADE_TRANSACTION_DEAL_ADD ||
       transaction.type == TRADE_TRANSACTION_ORDER_ADD ||
