@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 #property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
@@ -73,12 +73,12 @@ input EntryMode InpEntryMode                  = ENTRY_DIRECTIONAL_SINGLE;
 // hit rate can be measured before any capital logic depends on it. When false
 // the EA trades AND still writes probe rows, so one replay yields both datasets.
 input bool   InpProbeMode                     = false;
-// Geometry for single mode only; dual mode keeps its validated 2.5/50 values so
-// ENTRY_DUAL remains a bit-for-bit rollback. Symmetric 3.0/3.0 is chosen because
-// a fixed 0.64-pip commission means TIGHTENING the stop RAISES the required win
-// rate: 2.5/1.5 needs +28.5 points over a coin flip, 3.0/3.0 needs +19.0.
-input double InpDirectionalTakeProfitPips      = 3.0;
-input double InpDirectionalStopPips            = 3.0;
+// Single-mode geometry is specified in CASH and converted to pips at runtime
+// from the live tick value, so the targets stay at 0.50 / 3.00 GBP even as
+// GBP/USD moves. Dual mode keeps its validated 2.5/50 pip values, so
+// ENTRY_DUAL remains a bit-for-bit rollback.
+input double InpDirectionalTakeProfitGBP       = 0.50;
+input double InpDirectionalStopGBP             = 3.00;
 input double InpMinSignalScore                 = 0.60;
 input double InpMinVelocityPips100ms           = 0.05;
 input uint   InpSignalFastMs                   = 300;
@@ -92,7 +92,12 @@ input uint   InpProbeMinSamples                = 8;
 
 // --- Accuracy upgrades. Each is independently switchable so its contribution
 // --- can be measured in isolation rather than as a bundle.
-input double InpSignalSpreadMaxPips            = 0.30;  // strict compression gate
+// Directive 1: no spread or friction suppression. Both gates default OFF so
+// execution is never frozen waiting for a theoretical sub-spread. They remain
+// switchable purely so their cost can be measured, not to throttle by default.
+input bool   InpUseSpreadGate                  = false;
+input double InpSignalSpreadMaxPips            = 0.30;  // only used if gate on
+input bool   InpUseMicrostructureGate          = false; // 2s range / EWMA / tick-run
 input bool   InpUseMtfConfirmation             = true;
 input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
 input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
@@ -2039,10 +2044,18 @@ double DynamicSpreadLimitPips()
 
 bool CurrentTickEntryAdmissible()
 {
+   // Quote sanity and staleness are never negotiable: acting on a crossed or
+   // stale quote is a correctness failure, not a throttle.
    if(g_last_tick.ask <= g_last_tick.bid || g_last_tick.bid <= 0.0)
       return false;
    if(GetTickCount64() - g_last_tick_local_msc > InpEntryQuoteMaxAgeMs)
       return false;
+
+   // Directive 1/4: no background throttling in single mode. The stability and
+   // spread filters below are dual-mode controls and are bypassed unless
+   // explicitly re-enabled.
+   if(SingleLegMode() && !InpUseMicrostructureGate)
+      return true;
 
    const double spread = (g_last_tick.ask - g_last_tick.bid) / PipSize();
    if(spread > DynamicSpreadLimitPips())
@@ -2129,14 +2142,34 @@ bool SingleLegMode()
 
 // Structural stop for an open position. Dual mode keeps the 50-pip catastrophe
 // stop; single mode uses the tight directional stop as its primary risk control.
+// Value of one pip for InpLots in ACCOUNT currency (GBP), from live tick value.
+double PipValueAccount()
+{
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = TickSize();
+   if(tick_value <= 0.0 || tick_size <= 0.0)
+      return 0.0;
+   return tick_value * (PipSize() / tick_size) * InpLots;
+}
+
 double StructuralStopPips()
 {
-   return (SingleLegMode() ? InpDirectionalStopPips : InpAnchorServerStopPips);
+   if(!SingleLegMode())
+      return InpAnchorServerStopPips;
+   const double pip_value = PipValueAccount();
+   if(pip_value <= 0.0)
+      return InpAnchorServerStopPips;         // fail safe: never unprotected
+   return InpDirectionalStopGBP / pip_value;
 }
 
 double TargetPips()
 {
-   return (SingleLegMode() ? InpDirectionalTakeProfitPips : InpTakeProfitPips);
+   if(!SingleLegMode())
+      return InpTakeProfitPips;
+   const double pip_value = PipValueAccount();
+   if(pip_value <= 0.0)
+      return InpTakeProfitPips;
+   return InpDirectionalTakeProfitGBP / pip_value;
 }
 
 double BrokerStopLevelPips()
@@ -2343,7 +2376,7 @@ int DirectionalBias(SignalFeatures &features)
    const double pip = PipSize();
    const double spread_pips = (g_last_tick.ask > g_last_tick.bid
                                ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
-   if(spread_pips > InpSignalSpreadMaxPips)
+   if(InpUseSpreadGate && spread_pips > InpSignalSpreadMaxPips)
    {
       ++g_reject_counts[REJ_SPREAD];
       return 0;
@@ -2501,7 +2534,9 @@ bool StrictEntryGate()
       return false;
    if(g_position_count != 0 || g_order_count != 0 || g_cycle_id != 0)
       return false;
-   if(g_entry_admissible_ticks < 3)
+   // The 3-consecutive-tick run is part of the microstructure throttle.
+   const int required_ticks = ((SingleLegMode() && !InpUseMicrostructureGate) ? 1 : 3);
+   if(g_entry_admissible_ticks < required_ticks)
       return false;
    if(!CurrentTickEntryAdmissible())
       return false;
@@ -3927,7 +3962,12 @@ void Drive()
       g_drive_busy = false;
       return;
    }
-   if(active_cycle && liquidation <= -InpSoftCycleLossGBP)
+   // Soft cash is a dual-mode BASKET control. In single mode the position's own
+   // server stop is the risk limit, and a GBP 3.00 stop plus exit commission and
+   // reserves reaches -3.37, which would trip a 3.24 soft cap and market-close
+   // the trade BEFORE its own stop. That would silently override the mandated
+   // geometry, so the soft cap is suppressed; the hard budget still bounds it.
+   if(!SingleLegMode() && active_cycle && liquidation <= -InpSoftCycleLossGBP)
    {
       LatchResolution(RESOLVE_SOFT_CASH);
       FlattenOneAction();
@@ -4052,13 +4092,43 @@ bool ValidateStaticConfiguration()
                   InpTakeProfitPips, min_stop_pips);
       return false;
    }
-   if(SingleLegMode() &&
-      (InpDirectionalTakeProfitPips <= min_stop_pips || InpDirectionalStopPips <= min_stop_pips))
+   if(SingleLegMode())
    {
-      PrintFormat("Initialization failed: directional TP %.2f / stop %.2f must exceed broker "
-                  "stop level %.2f pips.", InpDirectionalTakeProfitPips,
-                  InpDirectionalStopPips, min_stop_pips);
-      return false;
+      const double pip_value = PipValueAccount();
+      if(pip_value <= 0.0)
+      {
+         Print("Initialization failed: cannot resolve pip value; cash targets are unusable.");
+         return false;
+      }
+      const double tp_pips = TargetPips();
+      const double sl_pips = StructuralStopPips();
+      if(tp_pips <= min_stop_pips || sl_pips <= min_stop_pips)
+      {
+         PrintFormat("Initialization failed: directional TP %.2f / stop %.2f pips must exceed "
+                     "broker stop level %.2f pips.", tp_pips, sl_pips, min_stop_pips);
+         return false;
+      }
+      if(InpBreakevenTriggerPips >= tp_pips)
+      {
+         PrintFormat("Initialization failed: breakeven trigger %.2f pips must be inside the "
+                     "%.2f-pip target.", InpBreakevenTriggerPips, tp_pips);
+         return false;
+      }
+      // The hard budget must still be able to contain one full stop plus the
+      // costs of closing it, otherwise the catastrophe net would fire first and
+      // pre-empt the mandated stop.
+      const double worst = InpDirectionalStopGBP + InpLots * InpExitCommissionPerLotGBP +
+                           InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP;
+      if(InpHardCycleLossGBP <= worst)
+      {
+         PrintFormat("Initialization failed: InpHardCycleLossGBP (%.2f) must exceed the worst "
+                     "single-trade liquidation of %.2f GBP (stop %.2f + costs).",
+                     InpHardCycleLossGBP, worst, InpDirectionalStopGBP);
+         return false;
+      }
+      PrintFormat("Single-leg geometry: TP %.2f GBP = %.2f pips | stop %.2f GBP = %.2f pips | "
+                  "pip value %.4f GBP", InpDirectionalTakeProfitGBP, tp_pips,
+                  InpDirectionalStopGBP, sl_pips, pip_value);
    }
 
    // The flatten window must be nested inside the no-new-risk window. If it is
@@ -4079,12 +4149,13 @@ bool ValidateStaticConfiguration()
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
       InpEmergencySlippageReserveGBP < 0.0 || InpUnlinkedChargeReserveGBP < 0.0 ||
       InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP >= InpHardCycleLossGBP ||
-      InpDirectionalTakeProfitPips <= 0.0 || InpSignalSpreadMaxPips <= 0.0 ||
+      InpDirectionalTakeProfitGBP <= 0.0 || InpDirectionalStopGBP <= 0.0 ||
+      InpDirectionalTakeProfitGBP >= InpDirectionalStopGBP * 10.0 ||
+      InpSignalSpreadMaxPips <= 0.0 ||
       InpMtfFastEmaPeriod < 1 || InpMtfSlowEmaPeriod <= InpMtfFastEmaPeriod ||
       InpAtrPeriod < 2 || InpMinAtrPips < 0.0 || InpAtrExpansionRatio < 1.0 ||
       InpBreakevenTriggerPips <= 0.0 || InpBreakevenOffsetPips < 0.0 ||
-      InpBreakevenTriggerPips >= InpDirectionalTakeProfitPips ||
-      InpDirectionalStopPips <= 0.0 || InpMinSignalScore <= 0.0 ||
+      InpMinSignalScore <= 0.0 ||
       InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
       InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
       InpImbalanceWindowMs == 0 || InpProbeMinSamples < 3 ||
