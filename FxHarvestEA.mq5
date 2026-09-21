@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "2.30"
+#property version   "2.40"
 #property strict
 #property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
@@ -114,6 +114,12 @@ input bool   InpUseLimitEntry                   = true;
 input double InpLimitOffsetPips                 = 0.0;   // 0 = at the touch
 input uint   InpLimitTimeoutMs                  = 1500;
 input double InpLimitCancelDistancePips         = 1.0;   // cancel if price runs away
+
+// --- Targeted loss mitigation. These only ever REDUCE exposure or DELAY entry;
+// --- none of them alter the preserved geometry or entry mechanics.
+input uint   InpStaleTradeExitMinutes           = 15;    // 0 disables
+input uint   InpPostLossCooldownMinutes         = 15;    // 0 disables
+input uint   InpMondayOpenQuietMinutes          = 60;    // 0 disables
 input bool   InpUseMtfConfirmation             = false;
 input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
 input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
@@ -163,7 +169,8 @@ enum ResolveReason
    RESOLVE_SOFT_CASH,
    RESOLVE_LEDGER_ESCAPE,
    RESOLVE_RUNTIME_INVALID,
-   RESOLVE_FRICTION_CAP
+   RESOLVE_FRICTION_CAP,
+   RESOLVE_STALE_EXIT
 };
 
 enum ProtectionResult
@@ -371,10 +378,14 @@ bool          g_breakeven_armed           = false;
 #define REJ_MTF        5
 #define REJ_ATR        6
 #define REJ_SPIKE      7
-#define REJ_ADMITTED   8
-#define REJ_SLOTS      9
+#define REJ_COOLDOWN   8
+#define REJ_SESSION    9
+#define REJ_ADMITTED   10
+#define REJ_SLOTS      11
 ulong         g_reject_counts[REJ_SLOTS];
 ulong         g_spike_block_until_msc     = 0;
+// Cross-cycle: a full stop ends the cycle, so this must outlive ClearCycleState.
+datetime      g_post_loss_cooldown_until  = 0;
 
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
@@ -586,6 +597,7 @@ void PersistState()
    GlobalVariableSet(StateKey("intent_time"),     (double)g_intent_submitted_at);
    GlobalVariableSet(StateKey("quarantine"),      (double)g_quarantine_until);
    GlobalVariableSet(StateKey("be_armed"),        (g_breakeven_armed ? 1.0 : 0.0));
+   GlobalVariableSet(StateKey("loss_cooldown"),   (double)g_post_loss_cooldown_until);
    GlobalVariableSet(StateKey("tomb_op"),         (double)g_tomb_operation);
    GlobalVariableSet(StateKey("tomb_role"),       (double)g_tomb_role);
    GlobalVariableSet(StateKey("tomb_volume"),     g_tomb_expected_volume);
@@ -684,6 +696,8 @@ void LoadState()
       g_quarantine_until = (datetime)GlobalVariableGet(StateKey("quarantine"));
    if(GlobalVariableCheck(StateKey("be_armed")))
       g_breakeven_armed = (GlobalVariableGet(StateKey("be_armed")) > 0.5);
+   if(GlobalVariableCheck(StateKey("loss_cooldown")))
+      g_post_loss_cooldown_until = (datetime)GlobalVariableGet(StateKey("loss_cooldown"));
    g_intent_cycle = LoadUlong("intent_cycle");
    g_intent_generation = LoadUlong("intent_gen");
    g_intent_request_id = LoadUlong("intent_request");
@@ -1339,6 +1353,7 @@ string ResolveReasonName(const ResolveReason reason)
    if(reason == RESOLVE_LEDGER_ESCAPE)  return "RESOLVE_LEDGER_ESCAPE";
    if(reason == RESOLVE_RUNTIME_INVALID)return "RESOLVE_RUNTIME_INVALID";
    if(reason == RESOLVE_FRICTION_CAP)   return "RESOLVE_FRICTION_CAP";
+   if(reason == RESOLVE_STALE_EXIT)     return "RESOLVE_STALE_EXIT";
    return "RESOLVE_NONE";
 }
 
@@ -2635,11 +2650,12 @@ void LogGateAttribution()
    }
    PrintFormat("Gate attribution over %I64u evaluations: spread=%I64u stability=%I64u "
                "samples=%I64u score=%I64u velocity=%I64u atr=%I64u mtf=%I64u spike=%I64u "
-               "ADMITTED=%I64u (%.3f%%)",
+               "cooldown=%I64u session=%I64u ADMITTED=%I64u (%.3f%%)",
                total, g_reject_counts[REJ_SPREAD], g_reject_counts[REJ_STABILITY],
                g_reject_counts[REJ_SAMPLES], g_reject_counts[REJ_SCORE],
                g_reject_counts[REJ_VELOCITY], g_reject_counts[REJ_ATR],
                g_reject_counts[REJ_MTF], g_reject_counts[REJ_SPIKE],
+               g_reject_counts[REJ_COOLDOWN], g_reject_counts[REJ_SESSION],
                g_reject_counts[REJ_ADMITTED],
                (double)g_reject_counts[REJ_ADMITTED] / (double)total * 100.0);
 }
@@ -2745,6 +2761,19 @@ bool StrictEntryGate()
       return false;
    if(!CurrentTickEntryAdmissible())
       return false;
+
+   // Anti-cascade: pause after a full stop so a sudden micro-trend cannot be
+   // re-entered repeatedly. Only delays entry; never touches an open position.
+   if(PostLossCooldownActive())
+   {
+      ++g_reject_counts[REJ_COOLDOWN];
+      return false;
+   }
+   if(InWeekOpenQuietWindow())
+   {
+      ++g_reject_counts[REJ_SESSION];
+      return false;
+   }
 
    if(!SingleLegMode())
       return true;
@@ -2884,6 +2913,57 @@ bool FrictionCapReached()
             g_soft_release_count >= InpMaxSoftReleasesPerCycle) ||
            (InpMaxBrakeRealizedLossGBP > 0.0 &&
             g_brake_realized_loss_gbp + 1.0e-8 >= InpMaxBrakeRealizedLossGBP));
+}
+
+// Time-decay exit: a position that has aged past the stale window AND is still
+// floating negative is closed at market rather than waiting for the full stop.
+// Winners are untouched, so the TP path is unchanged.
+bool StaleNegativePositionExists()
+{
+   if(InpStaleTradeExitMinutes == 0)
+      return false;
+   const datetime now = TimeTradeServer();
+   const datetime limit = (datetime)InpStaleTradeExitMinutes * 60;
+   for(int index = 0; index < g_position_count; ++index)
+   {
+      const PositionRecord position = g_positions[index];
+      if(position.open_time <= 0 || now - position.open_time < limit)
+         continue;
+      if(position.profit + position.swap < 0.0)
+         return true;
+   }
+   return false;
+}
+
+bool PostLossCooldownActive()
+{
+   return (InpPostLossCooldownMinutes > 0 && g_post_loss_cooldown_until > 0 &&
+           TimeTradeServer() < g_post_loss_cooldown_until);
+}
+
+// Illiquidity fence for the first minutes of the trading week. Uses the symbol's
+// own first session of the day so broker timezones need no hardcoding.
+bool InWeekOpenQuietWindow()
+{
+   if(InpMondayOpenQuietMinutes == 0)
+      return false;
+   MqlDateTime now_parts;
+   TimeToStruct(TimeTradeServer(), now_parts);
+   const ENUM_DAY_OF_WEEK today = (ENUM_DAY_OF_WEEK)now_parts.day_of_week;
+   if(today != SUNDAY && today != MONDAY)
+      return false;
+
+   datetime from_time = 0;
+   datetime to_time = 0;
+   if(!SymbolInfoSessionTrade(_Symbol, today, 0, from_time, to_time))
+      return false;
+
+   MqlDateTime start_parts;
+   TimeToStruct(from_time, start_parts);
+   const long start_second = (long)start_parts.hour * 3600 + (long)start_parts.min * 60 + start_parts.sec;
+   const long now_second = (long)now_parts.hour * 3600 + (long)now_parts.min * 60 + now_parts.sec;
+   const long quiet = (long)InpMondayOpenQuietMinutes * 60;
+   return (now_second >= start_second && now_second < start_second + quiet);
 }
 
 bool MaximumAnchorAgeReached()
@@ -4196,6 +4276,16 @@ void Drive()
       return;
    }
 
+   // P2.7: stagnation exit. Sits with the other time-based exits so it cannot be
+   // overtaken by brake or entry maintenance.
+   if(active_cycle && StaleNegativePositionExists())
+   {
+      LatchResolution(RESOLVE_STALE_EXIT);
+      FlattenOneAction();
+      g_drive_busy = false;
+      return;
+   }
+
    // P3: protection and arming invariants. Inventory shape was validated
    // before monetary policy so malformed/foreign records cannot contaminate
    // the cycle ledger.
@@ -4442,6 +4532,8 @@ bool ValidateStaticConfiguration()
       InpSpikeWindowMs == 0 || InpSpikeWindowMs > 60000 ||
       InpLimitOffsetPips < 0.0 || InpLimitTimeoutMs == 0 ||
       InpLimitCancelDistancePips <= 0.0 ||
+      InpStaleTradeExitMinutes > 1440 || InpPostLossCooldownMinutes > 1440 ||
+      InpMondayOpenQuietMinutes > 1440 ||
       InpMinSignalScore <= 0.0 ||
       InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
       InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
@@ -4653,6 +4745,36 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    // inventory-count change, so it must invalidate the telemetry cache.
    if(transaction.type == TRADE_TRANSACTION_DEAL_ADD)
       g_telemetry_dirty = true;
+
+   // Arm the post-loss cooldown only on a genuine full stop. DEAL_REASON_SL also
+   // fires for a breakeven-trail exit, which costs about spread+commission, so
+   // the magnitude is what separates the two. Half the configured stop is well
+   // above any breakeven exit and well below a full one.
+   if(InpPostLossCooldownMinutes > 0 && transaction.type == TRADE_TRANSACTION_DEAL_ADD &&
+      transaction.deal != 0 && HistoryDealSelect(transaction.deal))
+   {
+      const ulong deal = transaction.deal;
+      if((long)HistoryDealGetInteger(deal, DEAL_MAGIC) == InpMagic &&
+         HistoryDealGetString(deal, DEAL_SYMBOL) == _Symbol)
+      {
+         const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+         {
+            const double net = HistoryDealGetDouble(deal, DEAL_PROFIT) +
+                               HistoryDealGetDouble(deal, DEAL_COMMISSION) +
+                               HistoryDealGetDouble(deal, DEAL_SWAP) +
+                               HistoryDealGetDouble(deal, DEAL_FEE);
+            if(net <= -(InpDirectionalStopGBP * 0.5))
+            {
+               g_post_loss_cooldown_until = TimeTradeServer() +
+                                            (datetime)InpPostLossCooldownMinutes * 60;
+               PrintFormat("Post-loss cooldown armed: deal net %.2f GBP, entries paused until %s",
+                           net, TimeToString(g_post_loss_cooldown_until, TIME_DATE | TIME_SECONDS));
+               PersistState();
+            }
+         }
+      }
+   }
 
    if(transaction.type == TRADE_TRANSACTION_DEAL_ADD ||
       transaction.type == TRADE_TRANSACTION_ORDER_ADD ||
