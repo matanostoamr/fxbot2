@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "2.10"
+#property version   "2.20"
 #property strict
 #property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
@@ -77,8 +77,8 @@ input bool   InpProbeMode                     = false;
 // from the live tick value, so the targets stay at 0.50 / 3.00 GBP even as
 // GBP/USD moves. Dual mode keeps its validated 2.5/50 pip values, so
 // ENTRY_DUAL remains a bit-for-bit rollback.
-input double InpDirectionalTakeProfitGBP       = 0.50;
-input double InpDirectionalStopGBP             = 3.00;
+input double InpDirectionalTakeProfitGBP       = 0.20;
+input double InpDirectionalStopGBP             = 2.00;
 input double InpMinSignalScore                 = 0.60;
 input double InpMinVelocityPips100ms           = 0.05;
 input uint   InpSignalFastMs                   = 300;
@@ -98,18 +98,27 @@ input uint   InpProbeMinSamples                = 8;
 input bool   InpUseSpreadGate                  = false;
 input double InpSignalSpreadMaxPips            = 0.30;  // only used if gate on
 input bool   InpUseMicrostructureGate          = false; // 2s range / EWMA / tick-run
-input bool   InpUseMtfConfirmation             = true;
+// Directives 3/4: the spike shield is the ONLY condition that pauses entry, so
+// the indicator confirmations default OFF. They stay switchable for A/B work.
+input bool   InpUseMicroBiasOnly                = true;   // direction = sign(micro-slope)
+input bool   InpUseSpikeShield                  = true;
+input double InpSpikeTickDeltaPips              = 3.0;    // |mid move| within the window
+input uint   InpSpikeWindowMs                   = 100;
+input double InpSpikeSpreadPips                 = 2.5;
+input uint   InpSpikeCooldownMs                 = 1000;   // 0 = re-engage instantly
+input bool   InpInstantChaining                 = true;
+input bool   InpUseMtfConfirmation             = false;
 input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
 input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
 input int    InpMtfFastEmaPeriod               = 8;
 input int    InpMtfSlowEmaPeriod               = 21;
-input bool   InpUseVolatilityBurst             = true;
+input bool   InpUseVolatilityBurst             = false;
 input ENUM_TIMEFRAMES InpAtrTimeframe          = PERIOD_M1;
 input int    InpAtrPeriod                      = 14;
 input double InpMinAtrPips                     = 1.0;
 input double InpAtrExpansionRatio              = 1.10;
 input bool   InpUseBreakevenTrail              = true;
-input double InpBreakevenTriggerPips           = 1.5;
+input double InpBreakevenTriggerPips           = 0.8;
 input double InpBreakevenOffsetPips            = 0.0;   // 0 = entry price
 
 // The engine deliberately uses synchronous OrderSend calls and then reconciles
@@ -353,9 +362,11 @@ bool          g_breakeven_armed           = false;
 #define REJ_VELOCITY   4
 #define REJ_MTF        5
 #define REJ_ATR        6
-#define REJ_ADMITTED   7
-#define REJ_SLOTS      8
+#define REJ_SPIKE      7
+#define REJ_ADMITTED   8
+#define REJ_SLOTS      9
 ulong         g_reject_counts[REJ_SLOTS];
+ulong         g_spike_block_until_msc     = 0;
 
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
@@ -2369,10 +2380,59 @@ bool ComputeSignalFeatures(SignalFeatures &out)
    return true;
 }
 
+// Spike / abnormal-jump shield. Detects the largest mid excursion inside the
+// window and a spread explosion. This only blocks NEW entries; positions
+// already open keep their server stop and are never abandoned mid-spike.
+bool AbnormalMarket(double &max_delta_pips, double &spread_pips)
+{
+   const double pip = PipSize();
+   max_delta_pips = 0.0;
+   spread_pips = (g_last_tick.ask > g_last_tick.bid
+                  ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
+   if(!InpUseSpikeShield)
+      return false;
+
+   if(spread_pips > InpSpikeSpreadPips)
+      return true;
+
+   const long newest = g_last_tick.time_msc;
+   double high = 0.0, low = 0.0;
+   bool seen = false;
+   for(int offset = 0; offset < g_sample_count; ++offset)
+   {
+      int index = g_sample_next - 1 - offset;
+      if(index < 0)
+         index += MAX_TICK_SAMPLES;
+      const long age = newest - g_samples[index].time_msc;
+      if(age < 0 || age > (long)InpSpikeWindowMs)
+         break;
+      const double mid = g_samples[index].mid;
+      if(!seen) { high = mid; low = mid; seen = true; }
+      else      { high = MathMax(high, mid); low = MathMin(low, mid); }
+   }
+   if(seen)
+      max_delta_pips = (high - low) / pip;
+   return (max_delta_pips > InpSpikeTickDeltaPips);
+}
+
 // Returns +1 / -1 when an admissible momentum-aligned entry exists, else 0.
 // Every rejection is attributed so a starved run can be diagnosed.
 int DirectionalBias(SignalFeatures &features)
 {
+   // Spike shield first: it is the only permitted reason to pause entry.
+   double spike_delta = 0.0, spike_spread = 0.0;
+   if(AbnormalMarket(spike_delta, spike_spread))
+   {
+      g_spike_block_until_msc = GetTickCount64() + InpSpikeCooldownMs;
+      ++g_reject_counts[REJ_SPIKE];
+      return 0;
+   }
+   if(InpUseSpikeShield && GetTickCount64() < g_spike_block_until_msc)
+   {
+      ++g_reject_counts[REJ_SPIKE];
+      return 0;
+   }
+
    const double pip = PipSize();
    const double spread_pips = (g_last_tick.ask > g_last_tick.bid
                                ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
@@ -2386,15 +2446,30 @@ int DirectionalBias(SignalFeatures &features)
       ++g_reject_counts[REJ_SAMPLES];
       return 0;
    }
-   if(features.velocity_pips_100ms < InpMinVelocityPips100ms)
+   // Micro-bias mode: continuous minute-by-minute participation. Direction is
+   // the raw sign of the micro-slope, with no magnitude or velocity threshold.
+   if(InpUseMicroBiasOnly)
    {
-      ++g_reject_counts[REJ_VELOCITY];
-      return 0;
+      if(features.slope_pips > 0.0)      features.direction = 1;
+      else if(features.slope_pips < 0.0) features.direction = -1;
+      else
+      {
+         ++g_reject_counts[REJ_SCORE];
+         return 0;
+      }
    }
-   if(MathAbs(features.score) < InpMinSignalScore)
+   else
    {
-      ++g_reject_counts[REJ_SCORE];
-      return 0;
+      if(features.velocity_pips_100ms < InpMinVelocityPips100ms)
+      {
+         ++g_reject_counts[REJ_VELOCITY];
+         return 0;
+      }
+      if(MathAbs(features.score) < InpMinSignalScore)
+      {
+         ++g_reject_counts[REJ_SCORE];
+         return 0;
+      }
    }
 
    double atr_pips = 0.0, atr_ratio = 0.0;
@@ -2431,11 +2506,13 @@ void LogGateAttribution()
       return;
    }
    PrintFormat("Gate attribution over %I64u evaluations: spread=%I64u stability=%I64u "
-               "samples=%I64u score=%I64u velocity=%I64u atr=%I64u mtf=%I64u ADMITTED=%I64u (%.3f%%)",
+               "samples=%I64u score=%I64u velocity=%I64u atr=%I64u mtf=%I64u spike=%I64u "
+               "ADMITTED=%I64u (%.3f%%)",
                total, g_reject_counts[REJ_SPREAD], g_reject_counts[REJ_STABILITY],
                g_reject_counts[REJ_SAMPLES], g_reject_counts[REJ_SCORE],
                g_reject_counts[REJ_VELOCITY], g_reject_counts[REJ_ATR],
-               g_reject_counts[REJ_MTF], g_reject_counts[REJ_ADMITTED],
+               g_reject_counts[REJ_MTF], g_reject_counts[REJ_SPIKE],
+               g_reject_counts[REJ_ADMITTED],
                (double)g_reject_counts[REJ_ADMITTED] / (double)total * 100.0);
 }
 
@@ -3094,7 +3171,11 @@ bool ReconcileOutstandingIntent()
 
    if(g_intent_operation == INTENT_MODIFY_PROTECTION)
    {
-      if(g_intent_status == INTENT_STATUS_ACCEPTED && IntentAgeReached(InpSettlementQuietMs))
+      // Instant chaining removes the TIME-based wait. A protection change has no
+      // inventory to reconcile, so once the broker has accepted it there is
+      // nothing left to confirm and the slot can be freed on the same tick.
+      const uint settle = (InpInstantChaining ? 0 : InpSettlementQuietMs);
+      if(g_intent_status == INTENT_STATUS_ACCEPTED && IntentAgeReached(settle))
       {
          ClearIntent();
          return false;
@@ -3171,6 +3252,11 @@ bool ReconcileOutstandingIntent()
    else if(g_intent_operation == INTENT_CLOSE_POSITION ||
            g_intent_operation == INTENT_BRAKE_SOFT_RELEASE)
    {
+      // This is already causal, not time-based: the instant the closed position
+      // leaves the broker snapshot the slot frees, so chaining is same-tick.
+      // The barrier itself must stay -- without it an unconfirmed close can be
+      // followed by a new entry, producing two live positions in single mode and
+      // an immediate RESOLVE_INVARIANT flatten.
       const double current_volume = CurrentPositionVolumeByTicket(g_intent_target_ticket);
       const bool disappeared = (current_volume <= VolumeTolerance());
       const bool reduced = (current_volume + VolumeTolerance() < g_intent_target_volume);
@@ -4155,6 +4241,8 @@ bool ValidateStaticConfiguration()
       InpMtfFastEmaPeriod < 1 || InpMtfSlowEmaPeriod <= InpMtfFastEmaPeriod ||
       InpAtrPeriod < 2 || InpMinAtrPips < 0.0 || InpAtrExpansionRatio < 1.0 ||
       InpBreakevenTriggerPips <= 0.0 || InpBreakevenOffsetPips < 0.0 ||
+      InpSpikeTickDeltaPips <= 0.0 || InpSpikeSpreadPips <= 0.0 ||
+      InpSpikeWindowMs == 0 || InpSpikeWindowMs > 60000 ||
       InpMinSignalScore <= 0.0 ||
       InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
       InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
