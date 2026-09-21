@@ -3491,6 +3491,19 @@ bool ValidateStaticConfiguration()
       return false;
    }
 
+   // The flatten window must be nested inside the no-new-risk window. If it is
+   // wider, P2 latches RESOLVE_FRIDAY and flattens, ClearCycleState() clears the
+   // latch, then P8 sees itself outside the narrower no-risk window and arms a
+   // fresh pair, which P2 flattens again -- an arm/flatten loop that burns
+   // commission and spread on every iteration until the session closes.
+   if(InpNoNewRiskBeforeCloseMinutes < InpFridayFlattenMinutes)
+   {
+      PrintFormat("Initialization failed: InpNoNewRiskBeforeCloseMinutes (%u) must be >= "
+                  "InpFridayFlattenMinutes (%u) to prevent Friday arm/flatten cycles.",
+                  InpNoNewRiskBeforeCloseMinutes, InpFridayFlattenMinutes);
+      return false;
+   }
+
    if(InpLots <= 0.0 || InpTakeProfitPips <= 0.0 || InpAnchorServerStopPips <= 0.0 ||
       InpPolicyResetPips <= 0.0 || InpPolicyResetPips >= InpAnchorServerStopPips ||
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
