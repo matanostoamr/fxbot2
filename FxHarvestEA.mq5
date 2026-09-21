@@ -1,5 +1,5 @@
 #property copyright "Copyright 2026"
-#property version   "2.20"
+#property version   "2.30"
 #property strict
 #property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
@@ -107,6 +107,13 @@ input uint   InpSpikeWindowMs                   = 100;
 input double InpSpikeSpreadPips                 = 2.5;
 input uint   InpSpikeCooldownMs                 = 1000;   // 0 = re-engage instantly
 input bool   InpInstantChaining                 = true;
+// Passive limit entry. A BUY LIMIT rests at/below Bid and a SELL LIMIT at/above
+// Ask, so the entry price is better than crossing by roughly one spread -- but
+// it only fills if price first moves AGAINST the signal by that amount.
+input bool   InpUseLimitEntry                   = true;
+input double InpLimitOffsetPips                 = 0.0;   // 0 = at the touch
+input uint   InpLimitTimeoutMs                  = 1500;
+input double InpLimitCancelDistancePips         = 1.0;   // cancel if price runs away
 input bool   InpUseMtfConfirmation             = false;
 input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
 input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
@@ -186,7 +193,8 @@ enum IntentOperation
    INTENT_CLOSE_BY,
    INTENT_DELETE_ORDER,
    INTENT_MODIFY_PROTECTION,
-   INTENT_BRAKE_SOFT_RELEASE
+   INTENT_BRAKE_SOFT_RELEASE,
+   INTENT_ARM_LIMIT
 };
 
 enum IntentStatus
@@ -1000,7 +1008,12 @@ void RefreshSnapshot()
       ulong observed_generation = 0;
       const PositionRole role = ParseIntentCommentEx(OrderGetString(ORDER_COMMENT), observed_cycle,
                                                       observed_generation);
-      if(role != ROLE_BRAKE || !AdoptOrValidateCycle(observed_cycle))
+      // Dual mode only ever rests a brake stop. Single mode additionally rests a
+      // passive entry limit carrying an initial role.
+      const bool role_allowed = (role == ROLE_BRAKE ||
+                                 (SingleLegMode() &&
+                                  (role == ROLE_INITIAL_BUY || role == ROLE_INITIAL_SELL)));
+      if(!role_allowed || !AdoptOrValidateCycle(observed_cycle))
          g_snapshot_invalid = true;
 
       OrderRecord record;
@@ -1093,6 +1106,23 @@ int FindBrakeOrderIndex()
 {
    for(int index = 0; index < g_order_count; ++index)
       if(g_orders[index].role == ROLE_BRAKE)
+         return index;
+   return -1;
+}
+
+int EntryOrderCount()
+{
+   int count = 0;
+   for(int index = 0; index < g_order_count; ++index)
+      if(g_orders[index].role == ROLE_INITIAL_BUY || g_orders[index].role == ROLE_INITIAL_SELL)
+         ++count;
+   return count;
+}
+
+int FindEntryOrderIndex()
+{
+   for(int index = 0; index < g_order_count; ++index)
+      if(g_orders[index].role == ROLE_INITIAL_BUY || g_orders[index].role == ROLE_INITIAL_SELL)
          return index;
    return -1;
 }
@@ -1888,6 +1918,104 @@ bool SendBrakeStop(const int anchor_index)
       PersistState();
    }
    return accepted;
+}
+
+// Passive directional entry. BUY LIMIT rests at/below Bid, SELL LIMIT at/above
+// Ask, clamped so the broker's stops level cannot reject it.
+bool SendLimitEntry(const int direction)
+{
+   if(direction == 0)
+      return false;
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   const double pip = PipSize();
+   const double stops = BrokerStopLevelPips() * pip;
+   const bool buy = (direction > 0);
+   double price;
+   if(buy)
+   {
+      const double passive = tick.bid - InpLimitOffsetPips * pip;
+      const double cap = tick.ask - stops;           // must rest below the market
+      price = NormalizePriceDown(MathMin(passive, cap));
+      if(price >= tick.ask)
+         return false;
+   }
+   else
+   {
+      const double passive = tick.ask + InpLimitOffsetPips * pip;
+      const double floor_price = tick.bid + stops;   // must rest above the market
+      price = NormalizePriceUp(MathMax(passive, floor_price));
+      if(price <= tick.bid)
+         return false;
+   }
+
+   const PositionRole role = (buy ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL);
+   MqlTradeRequest request;
+   ZeroMemory(request);
+   request.action       = TRADE_ACTION_PENDING;
+   request.magic        = (ulong)InpMagic;
+   request.symbol       = _Symbol;
+   request.volume       = InpLots;
+   request.type         = (buy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT);
+   request.price        = price;
+   request.type_filling = ORDER_FILLING_RETURN;
+   request.type_time    = ORDER_TIME_GTC;
+   request.comment      = IntentComment(role);
+   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
+   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * TargetPips() * pip);
+
+   const bool accepted = SubmitRequest(request, "Passive entry limit " + RoleCode(role), true,
+                                       INTENT_ARM_LIMIT, role);
+   if(accepted)
+   {
+      g_arming_first_order = g_last_result_order;
+      PersistState();
+   }
+   return accepted;
+}
+
+// True when a resting entry limit should be withdrawn: it has aged out, or the
+// market has run away from it so the signal that placed it is stale.
+bool EntryLimitShouldCancel(const OrderRecord &order, string &reason)
+{
+   reason = "";
+   const double pip = PipSize();
+   const long now_msc = (g_last_tick.time_msc > 0 ? g_last_tick.time_msc : 0);
+   if(now_msc > 0 && order.setup_time_msc > 0 &&
+      now_msc - order.setup_time_msc >= (long)InpLimitTimeoutMs)
+   {
+      reason = "timeout";
+      return true;
+   }
+
+   // Runaway: price advanced past the limit in the signal's own direction, so
+   // filling now would mean buying into a move that already happened.
+   const bool buy = (order.type == ORDER_TYPE_BUY_LIMIT);
+   const double distance = (buy ? (g_last_tick.ask - order.open_price)
+                                : (order.open_price - g_last_tick.bid)) / pip;
+   if(distance >= InpLimitCancelDistancePips)
+   {
+      reason = "runaway";
+      return true;
+   }
+   return false;
+}
+
+bool HandleEntryLimitLifecycle()
+{
+   if(!SingleLegMode() || !InpUseLimitEntry)
+      return false;
+   const int index = FindEntryOrderIndex();
+   if(index < 0)
+      return false;
+
+   string reason = "";
+   if(!EntryLimitShouldCancel(g_orders[index], reason))
+      return false;
+   return DeleteOrderTicket(g_orders[index].ticket,
+                            "Entry limit cancel (" + reason + ")", INTENT_DELETE_ORDER);
 }
 
 bool SendMarketBrake(const int anchor_index)
@@ -2803,6 +2931,13 @@ bool InventoryShapeValid()
    const int base_count = BasePositionCount();
    const int brake_count = BrakePositionCount();
    const int brake_orders = BrakeOrderCount();
+   const int entry_orders = EntryOrderCount();
+
+   // Single mode: a resting passive entry limit is the one legal order while
+   // flat. Never both an entry limit and a live position.
+   if(SingleLegMode() && entry_orders > 0)
+      return (entry_orders == 1 && g_order_count == 1 && g_position_count == 0);
+
    if(base_count + brake_count != g_position_count || brake_orders != g_order_count)
       return false;
 
@@ -3181,6 +3316,36 @@ bool ReconcileOutstandingIntent()
          return false;
       }
    }
+   else if(g_intent_operation == INTENT_ARM_LIMIT)
+   {
+      // Live resting order, or a fill that already produced the position, both
+      // settle the request. A terminal unfilled order ends the cycle so the next
+      // tick can arm a fresh one against a fresh signal.
+      if(current_order != 0)
+      {
+         g_arming_first_order = current_order;
+         ClearIntent();
+         return false;
+      }
+      if(visible_volume > VolumeTolerance())
+      {
+         if(history_order != 0)
+            g_arming_first_order = history_order;
+         ClearIntent();
+         return false;
+      }
+      if(terminal_unfilled)
+      {
+         ClearIntent();
+         ClearCycleState();
+         return false;
+      }
+      if(complete_round_trip)
+      {
+         ClearIntent();
+         return false;
+      }
+   }
    else if(g_intent_operation == INTENT_BRAKE_STOP)
    {
       const double tolerance = VolumeTolerance();
@@ -3515,9 +3680,16 @@ bool ReconcileArmingTerminal()
 
    // Crash before PREPARED was flushed means OrderSend was never called. With
    // no broker inventory and no intent/order id it is safe to resume leg one.
+   // Single mode never replays: it clears and re-arms from a fresh signal, which
+   // is both safer and what rapid-fire chaining wants.
    if(g_position_count == 0 && g_order_count == 0 && !HasOutstandingIntent() &&
       g_arming_first_order == 0)
    {
+      if(SingleLegMode())
+      {
+         ClearCycleState();
+         return true;
+      }
       const bool buy_first = ((g_cycle_id % 2) == 0);
       if(SendMarketOpen((buy_first ? ORDER_TYPE_BUY : ORDER_TYPE_SELL), InpLots,
                         (buy_first ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL),
@@ -3531,7 +3703,14 @@ bool ReconcileArmingTerminal()
       return true;
    }
 
-   if(TimeTradeServer() - g_cycle_start < 5)
+   // A resting entry limit is a legitimate arming state, not a stalled one.
+   if(SingleLegMode() && EntryOrderCount() > 0)
+      return false;
+
+   // The 5-second settle is a dual-mode safeguard; it would stall rapid-fire
+   // chaining, and in single mode the order state is already causally terminal.
+   const int settle_seconds = ((SingleLegMode() && InpInstantChaining) ? 0 : 5);
+   if(TimeTradeServer() - g_cycle_start < settle_seconds)
       return false;
 
    bool filled = false;
@@ -3852,6 +4031,16 @@ bool ArmFreshCycle()
       buy_first = (g_pending_entry_direction > 0);
    }
 
+   if(SingleLegMode() && InpUseLimitEntry)
+   {
+      if(!SendLimitEntry(g_pending_entry_direction))
+      {
+         ClearCycleState();
+         return false;
+      }
+      return true;
+   }
+
    const bool accepted = SendMarketOpen((buy_first ? ORDER_TYPE_BUY : ORDER_TYPE_SELL), InpLots,
                                         (buy_first ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL),
                                         INTENT_ARM_FIRST);
@@ -4107,6 +4296,14 @@ void Drive()
       }
    }
 
+   // P7.5: withdraw a stale or overtaken passive entry limit.
+   if(HandleEntryLimitLifecycle())
+   {
+      PersistState();
+      g_drive_busy = false;
+      return;
+   }
+
    // P8: only a fully flat, order-free cycle may arm a fresh symmetric pair.
    if(g_position_count == 0 && g_order_count == 0 && g_cycle_id == 0 &&
       !HasOutstandingIntent() && !HasTimedOutTombstone() &&
@@ -4243,6 +4440,8 @@ bool ValidateStaticConfiguration()
       InpBreakevenTriggerPips <= 0.0 || InpBreakevenOffsetPips < 0.0 ||
       InpSpikeTickDeltaPips <= 0.0 || InpSpikeSpreadPips <= 0.0 ||
       InpSpikeWindowMs == 0 || InpSpikeWindowMs > 60000 ||
+      InpLimitOffsetPips < 0.0 || InpLimitTimeoutMs == 0 ||
+      InpLimitCancelDistancePips <= 0.0 ||
       InpMinSignalScore <= 0.0 ||
       InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
       InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
