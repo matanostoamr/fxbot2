@@ -1,7 +1,7 @@
 #property copyright "Copyright 2026"
-#property version   "1.12"
+#property version   "2.00"
 #property strict
-#property description "Dual-sided EURUSD harvester with spatial brake hysteresis and friction cap"
+#property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
 #define EA_TAG              "FX2"
 #define MAX_OWNED_POSITIONS 8
@@ -13,6 +13,12 @@ enum BrakeReleaseReference
 {
    RELEASE_FROM_FILL = 0,     // validated PR #2 behaviour, spread-dependent
    RELEASE_FROM_TRIGGER = 1   // spread-independent, strictly wider distance
+};
+
+enum EntryMode
+{
+   ENTRY_DUAL = 0,               // validated e36ddfeb engine, bit-for-bit
+   ENTRY_DIRECTIONAL_SINGLE = 1  // Option B: one momentum-aligned leg
 };
 
 input long   InpMagic                         = 26092026;
@@ -58,6 +64,26 @@ input uint   InpTimerPeriodMs                  = 50;
 input uint   InpLeaseStaleSeconds              = 15;
 input bool   InpTelemetryEnabled               = true;
 input string InpTelemetryFilePrefix            = "FxHarvestEA";
+
+// --- Option B: directional single-leg momentum harvester -------------------
+// ENTRY_DUAL reproduces the validated e36ddfeb engine exactly. Every branch
+// below is mode-gated, so switching back is a one-input rollback.
+input EntryMode InpEntryMode                  = ENTRY_DIRECTIONAL_SINGLE;
+// Probe mode logs the signal and its forward outcome WITHOUT trading, so the
+// hit rate can be measured before any capital logic depends on it. When false
+// the EA trades AND still writes probe rows, so one replay yields both datasets.
+input bool   InpProbeMode                     = false;
+input double InpDirectionalStopPips            = 2.0;   // structural stop, single mode
+input double InpMinSignalScore                 = 0.60;
+input double InpMinVelocityPips100ms           = 0.05;
+input uint   InpSignalFastMs                   = 300;
+input uint   InpSignalSlowMs                   = 2000;
+input uint   InpBreakoutWindowMs               = 500;
+input uint   InpImbalanceWindowMs              = 1000;
+input double InpWeightSlope                    = 1.0;
+input double InpWeightBreakout                 = 1.0;
+input double InpWeightImbalance                = 1.0;
+input uint   InpProbeMinSamples                = 8;
 
 // The engine deliberately uses synchronous OrderSend calls and then reconciles
 // broker inventory. Request acceptance is never treated as fill confirmation.
@@ -266,6 +292,23 @@ bool          g_telemetry_dirty           = true;
 int           g_telemetry_last_positions  = -1;
 int           g_telemetry_last_orders     = -1;
 string        g_run_id                    = "";
+
+// Signal probe: one non-overlapping observation at a time, so recorded hit
+// rates are independent samples rather than correlated overlapping windows.
+bool          g_probe_active              = false;
+int           g_probe_direction           = 0;
+double        g_probe_entry_mid           = 0.0;
+double        g_probe_target_mid          = 0.0;
+double        g_probe_stop_mid            = 0.0;
+long          g_probe_open_msc            = 0;
+double        g_probe_score               = 0.0;
+double        g_probe_f1                  = 0.0;
+double        g_probe_f2                  = 0.0;
+double        g_probe_f3                  = 0.0;
+double        g_probe_f4                  = 0.0;
+double        g_probe_spread              = 0.0;
+ulong         g_probe_sequence            = 0;
+int           g_pending_entry_direction   = 0;
 
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
@@ -1721,7 +1764,7 @@ bool SendMarketOpen(const ENUM_ORDER_TYPE type, const double volume, const Posit
    request.deviation    = InpMaxDeviationPoints;
    request.type_filling = MarketFillingMode();
    request.comment      = IntentComment(role);
-   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * InpAnchorServerStopPips * pip);
+   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
    request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip);
    return SubmitRequest(request, "Market open " + RoleCode(role), true, operation, role);
 }
@@ -2017,15 +2060,260 @@ bool CanReduceRisk()
    return (mode == SYMBOL_TRADE_MODE_FULL || mode == SYMBOL_TRADE_MODE_CLOSEONLY);
 }
 
+// -----------------------------------------------------------------------------
+// Directional signal engine (Option B)
+// -----------------------------------------------------------------------------
+
+struct SignalFeatures
+{
+   double slope_pips;            // f1 EWMA(fast) - EWMA(slow)
+   double breakout_pips;         // f2 excursion beyond the preceding range
+   double imbalance;             // f3 (up - down) / total, in [-1, +1]
+   double velocity_pips_100ms;   // f4 realised path per 100 ms
+   double score;
+   int    direction;             // +1 buy, -1 sell, 0 none
+   int    samples;
+   bool   valid;
+};
+
+bool SingleLegMode()
+{
+   return (InpEntryMode == ENTRY_DIRECTIONAL_SINGLE);
+}
+
+// Structural stop for an open position. Dual mode keeps the 50-pip catastrophe
+// stop; single mode uses the tight directional stop as its primary risk control.
+double StructuralStopPips()
+{
+   return (SingleLegMode() ? InpDirectionalStopPips : InpAnchorServerStopPips);
+}
+
+// One pass over the tick ring buffer. All four features are derived from the
+// same window set, so no indicator, bar history or look-ahead is involved.
+bool ComputeSignalFeatures(SignalFeatures &out)
+{
+   out.slope_pips = 0.0;
+   out.breakout_pips = 0.0;
+   out.imbalance = 0.0;
+   out.velocity_pips_100ms = 0.0;
+   out.score = 0.0;
+   out.direction = 0;
+   out.samples = 0;
+   out.valid = false;
+
+   const double pip = PipSize();
+   if(pip <= 0.0 || g_sample_count <= 0 || g_last_tick.time_msc <= 0)
+      return false;
+
+   const long newest = g_last_tick.time_msc;
+   const long widest = (long)MathMax(InpSignalSlowMs,
+                          MathMax(InpBreakoutWindowMs, InpImbalanceWindowMs));
+   const double tau_fast = (double)InpSignalFastMs;
+   const double tau_slow = (double)InpSignalSlowMs;
+
+   double fast_num = 0.0, fast_den = 0.0, slow_num = 0.0, slow_den = 0.0;
+   double range_high = 0.0, range_low = 0.0;
+   bool   range_seen = false;
+   int    up_ticks = 0, down_ticks = 0;
+   double abs_path = 0.0;
+   long   path_span = 0;
+   double previous_mid = 0.0;
+   bool   previous_seen = false;
+   const double mid_now = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   int    samples = 0;
+
+   for(int offset = 0; offset < g_sample_count; ++offset)
+   {
+      int index = g_sample_next - 1 - offset;
+      if(index < 0)
+         index += MAX_TICK_SAMPLES;
+      const long age = newest - g_samples[index].time_msc;
+      if(age < 0 || age > widest)
+         break;
+
+      const double mid = g_samples[index].mid;
+      ++samples;
+
+      const double w_fast = MathExp(-(double)age / MathMax(1.0, tau_fast));
+      const double w_slow = MathExp(-(double)age / MathMax(1.0, tau_slow));
+      fast_num += mid * w_fast; fast_den += w_fast;
+      slow_num += mid * w_slow; slow_den += w_slow;
+
+      // Breakout range excludes the newest sample so "now" can exceed it.
+      if(offset > 0 && age <= (long)InpBreakoutWindowMs)
+      {
+         if(!range_seen) { range_high = mid; range_low = mid; range_seen = true; }
+         else { range_high = MathMax(range_high, mid); range_low = MathMin(range_low, mid); }
+      }
+
+      if(age <= (long)InpImbalanceWindowMs)
+      {
+         if(previous_seen)
+         {
+            // Iterating newest-first, so previous_mid is the LATER tick.
+            if(previous_mid > mid)      ++up_ticks;
+            else if(previous_mid < mid) ++down_ticks;
+            abs_path += MathAbs(previous_mid - mid);
+            path_span = age;
+         }
+         previous_mid = mid;
+         previous_seen = true;
+      }
+   }
+
+   out.samples = samples;
+   if(samples < (int)MathMax(3, InpProbeMinSamples) || fast_den <= 0.0 || slow_den <= 0.0)
+      return false;
+
+   out.slope_pips = ((fast_num / fast_den) - (slow_num / slow_den)) / pip;
+
+   if(range_seen)
+   {
+      if(mid_now > range_high)      out.breakout_pips = (mid_now - range_high) / pip;
+      else if(mid_now < range_low)  out.breakout_pips = (mid_now - range_low) / pip;
+   }
+
+   const int total_ticks = up_ticks + down_ticks;
+   if(total_ticks > 0)
+      out.imbalance = (double)(up_ticks - down_ticks) / (double)total_ticks;
+
+   if(path_span > 0)
+      out.velocity_pips_100ms = (abs_path / pip) / ((double)path_span / 100.0);
+
+   out.score = InpWeightSlope * out.slope_pips +
+               InpWeightBreakout * out.breakout_pips +
+               InpWeightImbalance * out.imbalance;
+   if(out.score > 0.0)      out.direction = 1;
+   else if(out.score < 0.0) out.direction = -1;
+   out.valid = true;
+   return true;
+}
+
+// Returns +1 / -1 when an admissible momentum-aligned entry exists, else 0.
+int DirectionalBias(SignalFeatures &features)
+{
+   if(!ComputeSignalFeatures(features))
+      return 0;
+   if(features.velocity_pips_100ms < InpMinVelocityPips100ms)
+      return 0;
+   if(MathAbs(features.score) < InpMinSignalScore)
+      return 0;
+   return features.direction;
+}
+
+string ProbeFileName()
+{
+   return StringFormat("%s_%I64d_%s_%I64d_signal.csv", InpTelemetryFilePrefix,
+                       AccountInfoInteger(ACCOUNT_LOGIN), _Symbol, InpMagic);
+}
+
+void WriteProbeRow(const string outcome, const long elapsed_msc, const double exit_mid)
+{
+   if(!InpTelemetryEnabled)
+      return;
+   int handle = FileOpen(ProbeFileName(), FILE_READ | FILE_WRITE | FILE_CSV |
+                         FILE_ANSI | FILE_COMMON | FILE_SHARE_READ, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      PrintFormat("Probe FileOpen failed: %s error=%d", ProbeFileName(), GetLastError());
+      return;
+   }
+   if(FileSize(handle) == 0)
+      FileWrite(handle, "schema", "run_id", "probe_id", "open_time", "direction",
+                "score", "f1_slope_pips", "f2_breakout_pips", "f3_imbalance",
+                "f4_velocity_pips_100ms", "spread_pips", "entry_mid", "target_mid",
+                "stop_mid", "exit_mid", "outcome", "elapsed_ms");
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle, "FX2-SIGNAL-V1", g_run_id, g_probe_sequence,
+             TimeToString((datetime)(g_probe_open_msc / 1000), TIME_DATE | TIME_SECONDS),
+             g_probe_direction, g_probe_score, g_probe_f1, g_probe_f2, g_probe_f3,
+             g_probe_f4, g_probe_spread, g_probe_entry_mid, g_probe_target_mid,
+             g_probe_stop_mid, exit_mid, outcome, elapsed_msc);
+   FileFlush(handle);
+   FileClose(handle);
+}
+
+// Opens a probe observation at the current signal, if none is outstanding.
+void OpenProbe(const SignalFeatures &features, const int direction)
+{
+   if(g_probe_active || direction == 0)
+      return;
+   const double pip = PipSize();
+   const double mid = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   const double spread_pips = (g_last_tick.ask - g_last_tick.bid) / pip;
+
+   // Both distances are expressed as MARKET movement, matching what the TP and
+   // the structural stop actually require once the spread is paid on entry.
+   const double target_move = (InpTakeProfitPips + spread_pips) * pip;
+   const double stop_move = MathMax(pip * 0.1,
+                                    (StructuralStopPips() - spread_pips) * pip);
+
+   g_probe_active = true;
+   ++g_probe_sequence;
+   g_probe_direction = direction;
+   g_probe_entry_mid = mid;
+   g_probe_target_mid = mid + direction * target_move;
+   g_probe_stop_mid = mid - direction * stop_move;
+   g_probe_open_msc = g_last_tick.time_msc;
+   g_probe_score = features.score;
+   g_probe_f1 = features.slope_pips;
+   g_probe_f2 = features.breakout_pips;
+   g_probe_f3 = features.imbalance;
+   g_probe_f4 = features.velocity_pips_100ms;
+   g_probe_spread = spread_pips;
+}
+
+// Resolves the outstanding observation on the current tick.
+void ResolveProbe()
+{
+   if(!g_probe_active)
+      return;
+   const double mid = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   const long elapsed = g_last_tick.time_msc - g_probe_open_msc;
+   bool hit_target = false;
+   bool hit_stop = false;
+   if(g_probe_direction > 0)
+   {
+      hit_target = (mid >= g_probe_target_mid);
+      hit_stop = (mid <= g_probe_stop_mid);
+   }
+   else
+   {
+      hit_target = (mid <= g_probe_target_mid);
+      hit_stop = (mid >= g_probe_stop_mid);
+   }
+   if(!hit_target && !hit_stop)
+      return;
+   // A tick that straddles both levels is recorded conservatively as a stop.
+   WriteProbeRow((hit_stop ? "STOP" : "TARGET"), elapsed, mid);
+   g_probe_active = false;
+}
+
 bool StrictEntryGate()
 {
+   g_pending_entry_direction = 0;
    if(!g_entry_config_valid || !CanOpenRisk())
       return false;
    if(g_position_count != 0 || g_order_count != 0 || g_cycle_id != 0)
       return false;
    if(g_entry_admissible_ticks < 3)
       return false;
-   return CurrentTickEntryAdmissible();
+   if(!CurrentTickEntryAdmissible())
+      return false;
+
+   if(!SingleLegMode())
+      return true;
+
+   // Probe mode measures the signal without ever creating exposure.
+   if(InpProbeMode)
+      return false;
+
+   SignalFeatures features;
+   const int direction = DirectionalBias(features);
+   if(direction == 0)
+      return false;
+   g_pending_entry_direction = direction;
+   return true;
 }
 
 int FridaySessionCloseSecond()
@@ -2214,6 +2502,8 @@ bool InventoryShapeValid()
 
    if(base_count == 2)
    {
+      if(SingleLegMode())
+         return false;               // two base legs is never valid in single mode
       if(brake_count != 0 || brake_orders != 0 || g_position_count != 2)
          return false;
       bool have_buy_role = false;
@@ -2233,6 +2523,9 @@ bool InventoryShapeValid()
       const int anchor_index = FindAnchorIndex();
       if(anchor_index < 0 || !VolumeEqual(g_positions[anchor_index].volume, InpLots))
          return false;
+      // Single-leg mode: exactly one base position, never a brake or brake order.
+      if(SingleLegMode())
+         return (brake_count == 0 && brake_orders == 0 && g_position_count == 1);
       const PositionRecord anchor = g_positions[anchor_index];
       for(int index = 0; index < g_position_count; ++index)
          if(g_positions[index].role == ROLE_BRAKE && g_positions[index].type == anchor.type)
@@ -2762,7 +3055,7 @@ ProtectionResult EnsurePositionProtection(const PositionRecord &position, const 
 {
    const double pip = PipSize();
    const bool buy = (position.type == POSITION_TYPE_BUY);
-   const double desired_sl = NormalizePriceNearest(position.open_price + (buy ? -1.0 : 1.0) * InpAnchorServerStopPips * pip);
+   const double desired_sl = NormalizePriceNearest(position.open_price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
    const double desired_tp = (remove_tp ? 0.0 : NormalizePriceNearest(position.open_price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip));
 
    const bool tp_wrong = (remove_tp ? position.tp != 0.0 : !NearlyEqual(position.tp, desired_tp));
@@ -2783,7 +3076,9 @@ ProtectionResult ReconcileProtectionOneAction()
    // A confirmed anchor has TP=0 before a pending or live brake exists.
    // During PHASE_ARMING the first leg retains its original TP while the
    // opposite initial leg is still being submitted.
-   if(anchor_index >= 0 && g_phase != PHASE_ARMING)
+   // In single-leg mode there is no partner and no brake: the lone position IS
+   // the trade, so it must keep its 2.5-pip TP.
+   if(anchor_index >= 0 && g_phase != PHASE_ARMING && !SingleLegMode())
    {
       const ProtectionResult anchor_result = EnsurePositionProtection(g_positions[anchor_index], true);
       if(anchor_result != PROTECTION_UNCHANGED)
@@ -2802,7 +3097,7 @@ ProtectionResult ReconcileProtectionOneAction()
       }
    }
 
-   if(BasePositionCount() == 2)
+   if(BasePositionCount() == 2 || SingleLegMode())
    {
       for(int index = 0; index < g_position_count; ++index)
       {
@@ -2941,6 +3236,21 @@ bool ReconcileArmingTerminal()
 
 bool HandleArmingCompletion()
 {
+   // Single-leg mode never submits an opposite initial leg; the confirmed first
+   // fill completes the cycle structure immediately.
+   if(SingleLegMode())
+   {
+      if(g_phase == PHASE_ARMING && BasePositionCount() == 1)
+      {
+         g_phase = PHASE_ANCHOR;
+         if(g_anchor_since == 0)
+            g_anchor_since = TimeTradeServer();
+         g_arming_second_sent = false;
+         PersistState();
+      }
+      return false;
+   }
+
    if(g_phase != PHASE_ARMING || BasePositionCount() != 1 || g_position_count != 1 || g_order_count != 0)
       return false;
 
@@ -3203,7 +3513,19 @@ bool ArmFreshCycle()
    g_arming_second_order = 0;
    PersistState();
 
-   const bool buy_first = ((g_cycle_id % 2) == 0);
+   // Dual mode alternates which side is submitted first to remove broker
+   // sequencing bias. Single mode takes its side from the momentum signal.
+   bool buy_first = ((g_cycle_id % 2) == 0);
+   if(SingleLegMode())
+   {
+      if(g_pending_entry_direction == 0)
+      {
+         ClearCycleState();
+         return false;
+      }
+      buy_first = (g_pending_entry_direction > 0);
+   }
+
    const bool accepted = SendMarketOpen((buy_first ? ORDER_TYPE_BUY : ORDER_TYPE_SELL), InpLots,
                                         (buy_first ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL),
                                         INTENT_ARM_FIRST);
@@ -3390,8 +3712,9 @@ void Drive()
    // A failed second arming leg converges to a provisional anchor.
    InferPhase();
 
-   // P4: soft distance and soft cash reset.
-   if(FindAnchorIndex() >= 0 && AnchorAdversePips() >= InpPolicyResetPips)
+   // P4: soft distance and soft cash reset. The distance reset is a dual-mode
+   // control; in single mode the structural stop is far tighter and binds first.
+   if(!SingleLegMode() && FindAnchorIndex() >= 0 && AnchorAdversePips() >= InpPolicyResetPips)
    {
       LatchResolution(RESOLVE_SOFT_DISTANCE);
       FlattenOneAction();
@@ -3438,7 +3761,10 @@ void Drive()
    }
 
    // P7: immutable pending brake and cancel-confirm-market fallback.
-   if(g_phase != PHASE_ARMING && FindAnchorIndex() >= 0 && BasePositionCount() == 1 &&
+   // Single-leg mode has no stranded anchor to hedge: the tight structural stop
+   // is the risk control, so no brake is ever armed.
+   if(!SingleLegMode() &&
+      g_phase != PHASE_ARMING && FindAnchorIndex() >= 0 && BasePositionCount() == 1 &&
       BrakePositionVolume() + VolumeTolerance() < g_positions[FindAnchorIndex()].volume)
    {
       if(HandlePendingBrake())
@@ -3539,6 +3865,11 @@ bool ValidateStaticConfiguration()
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
       InpEmergencySlippageReserveGBP < 0.0 || InpUnlinkedChargeReserveGBP < 0.0 ||
       InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP >= InpHardCycleLossGBP ||
+      InpDirectionalStopPips <= 0.0 || InpMinSignalScore <= 0.0 ||
+      InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
+      InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
+      InpImbalanceWindowMs == 0 || InpProbeMinSamples < 3 ||
+      InpSignalSlowMs > MAX_TICK_SAMPLES * 1000 ||
       InpBrakeOffsetPips <= 0.0 || InpBrakeSoftReleasePips <= 0.0 ||
       InpBrakeRearmAdvancePips <= 0.0 || InpMaxSoftReleasesPerCycle == 0 ||
       InpMaxBrakeRealizedLossGBP <= 0.0 || StringLen(InpTelemetryFilePrefix) == 0 ||
@@ -3657,6 +3988,21 @@ void OnTick()
       ++g_entry_admissible_ticks;
    else
       g_entry_admissible_ticks = 0;
+
+   // Signal probe runs in single mode regardless of whether the EA is trading,
+   // so one replay yields both execution results and forward-outcome samples.
+   if(SingleLegMode())
+   {
+      ResolveProbe();
+      if(!g_probe_active && g_entry_admissible_ticks >= 3 && CurrentTickEntryAdmissible())
+      {
+         SignalFeatures features;
+         const int direction = DirectionalBias(features);
+         if(direction != 0)
+            OpenProbe(features, direction);
+      }
+   }
+
    Drive();
 }
 
