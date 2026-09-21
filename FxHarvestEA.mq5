@@ -1,7 +1,7 @@
 #property copyright "Copyright 2026"
-#property version   "1.10"
+#property version   "2.40"
 #property strict
-#property description "Dual-sided EURUSD harvester with spatial brake hysteresis and friction cap"
+#property description "EURUSD harvester: dual-sided or directional single-leg momentum entry"
 
 #define EA_TAG              "FX2"
 #define MAX_OWNED_POSITIONS 8
@@ -9,12 +9,30 @@
 #define MAX_TICK_SAMPLES    1024
 #define MAX_TELEMETRY_POSITIONS 128
 
+enum BrakeReleaseReference
+{
+   RELEASE_FROM_FILL = 0,     // validated PR #2 behaviour, spread-dependent
+   RELEASE_FROM_TRIGGER = 1   // spread-independent, strictly wider distance
+};
+
+enum EntryMode
+{
+   ENTRY_DUAL = 0,               // validated e36ddfeb engine, bit-for-bit
+   ENTRY_DIRECTIONAL_SINGLE = 1  // Option B: one momentum-aligned leg
+};
+
 input long   InpMagic                         = 26092026;
 input double InpLots                          = 0.02;
 input double InpTakeProfitPips                = 2.5;
 input double InpAnchorServerStopPips          = 50.0;
 input double InpBrakeOffsetPips               = 1.0;
 input double InpBrakeSoftReleasePips          = 1.0;
+// RELEASE_FROM_FILL reproduces the validated PR #2 economics: the distance is
+// measured from the brake fill, so the effective adverse market move is
+// (InpBrakeSoftReleasePips - spread). RELEASE_FROM_TRIGGER measures from the
+// stop trigger instead, making the distance spread-independent but strictly
+// wider, which raises the brake TP rate required to break even.
+input BrakeReleaseReference InpBrakeReleaseReference = RELEASE_FROM_FILL;
 input double InpBrakeRearmAdvancePips         = 2.0;
 input uint   InpMaxSoftReleasesPerCycle       = 2;
 input double InpMaxBrakeRealizedLossGBP       = 0.75;
@@ -46,6 +64,75 @@ input uint   InpTimerPeriodMs                  = 50;
 input uint   InpLeaseStaleSeconds              = 15;
 input bool   InpTelemetryEnabled               = true;
 input string InpTelemetryFilePrefix            = "FxHarvestEA";
+
+// --- Option B: directional single-leg momentum harvester -------------------
+// ENTRY_DUAL reproduces the validated e36ddfeb engine exactly. Every branch
+// below is mode-gated, so switching back is a one-input rollback.
+input EntryMode InpEntryMode                  = ENTRY_DIRECTIONAL_SINGLE;
+// Probe mode logs the signal and its forward outcome WITHOUT trading, so the
+// hit rate can be measured before any capital logic depends on it. When false
+// the EA trades AND still writes probe rows, so one replay yields both datasets.
+input bool   InpProbeMode                     = false;
+// Single-mode geometry is specified in CASH and converted to pips at runtime
+// from the live tick value, so the targets stay at 0.50 / 3.00 GBP even as
+// GBP/USD moves. Dual mode keeps its validated 2.5/50 pip values, so
+// ENTRY_DUAL remains a bit-for-bit rollback.
+input double InpDirectionalTakeProfitGBP       = 0.20;
+input double InpDirectionalStopGBP             = 2.00;
+input double InpMinSignalScore                 = 0.60;
+input double InpMinVelocityPips100ms           = 0.05;
+input uint   InpSignalFastMs                   = 300;
+input uint   InpSignalSlowMs                   = 2000;
+input uint   InpBreakoutWindowMs               = 500;
+input uint   InpImbalanceWindowMs              = 1000;
+input double InpWeightSlope                    = 1.0;
+input double InpWeightBreakout                 = 1.0;
+input double InpWeightImbalance                = 1.0;
+input uint   InpProbeMinSamples                = 8;
+
+// --- Accuracy upgrades. Each is independently switchable so its contribution
+// --- can be measured in isolation rather than as a bundle.
+// Directive 1: no spread or friction suppression. Both gates default OFF so
+// execution is never frozen waiting for a theoretical sub-spread. They remain
+// switchable purely so their cost can be measured, not to throttle by default.
+input bool   InpUseSpreadGate                  = false;
+input double InpSignalSpreadMaxPips            = 0.30;  // only used if gate on
+input bool   InpUseMicrostructureGate          = false; // 2s range / EWMA / tick-run
+// Directives 3/4: the spike shield is the ONLY condition that pauses entry, so
+// the indicator confirmations default OFF. They stay switchable for A/B work.
+input bool   InpUseMicroBiasOnly                = true;   // direction = sign(micro-slope)
+input bool   InpUseSpikeShield                  = true;
+input double InpSpikeTickDeltaPips              = 3.0;    // |mid move| within the window
+input uint   InpSpikeWindowMs                   = 100;
+input double InpSpikeSpreadPips                 = 2.5;
+input uint   InpSpikeCooldownMs                 = 1000;   // 0 = re-engage instantly
+input bool   InpInstantChaining                 = true;
+// Passive limit entry. A BUY LIMIT rests at/below Bid and a SELL LIMIT at/above
+// Ask, so the entry price is better than crossing by roughly one spread -- but
+// it only fills if price first moves AGAINST the signal by that amount.
+input bool   InpUseLimitEntry                   = true;
+input double InpLimitOffsetPips                 = 0.0;   // 0 = at the touch
+input uint   InpLimitTimeoutMs                  = 1500;
+input double InpLimitCancelDistancePips         = 1.0;   // cancel if price runs away
+
+// --- Targeted loss mitigation. These only ever REDUCE exposure or DELAY entry;
+// --- none of them alter the preserved geometry or entry mechanics.
+input uint   InpStaleTradeExitMinutes           = 15;    // 0 disables
+input uint   InpPostLossCooldownMinutes         = 15;    // 0 disables
+input uint   InpMondayOpenQuietMinutes          = 60;    // 0 disables
+input bool   InpUseMtfConfirmation             = false;
+input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
+input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
+input int    InpMtfFastEmaPeriod               = 8;
+input int    InpMtfSlowEmaPeriod               = 21;
+input bool   InpUseVolatilityBurst             = false;
+input ENUM_TIMEFRAMES InpAtrTimeframe          = PERIOD_M1;
+input int    InpAtrPeriod                      = 14;
+input double InpMinAtrPips                     = 1.0;
+input double InpAtrExpansionRatio              = 1.10;
+input bool   InpUseBreakevenTrail              = true;
+input double InpBreakevenTriggerPips           = 0.8;
+input double InpBreakevenOffsetPips            = 0.0;   // 0 = entry price
 
 // The engine deliberately uses synchronous OrderSend calls and then reconciles
 // broker inventory. Request acceptance is never treated as fill confirmation.
@@ -82,7 +169,8 @@ enum ResolveReason
    RESOLVE_SOFT_CASH,
    RESOLVE_LEDGER_ESCAPE,
    RESOLVE_RUNTIME_INVALID,
-   RESOLVE_FRICTION_CAP
+   RESOLVE_FRICTION_CAP,
+   RESOLVE_STALE_EXIT
 };
 
 enum ProtectionResult
@@ -112,7 +200,8 @@ enum IntentOperation
    INTENT_CLOSE_BY,
    INTENT_DELETE_ORDER,
    INTENT_MODIFY_PROTECTION,
-   INTENT_BRAKE_SOFT_RELEASE
+   INTENT_BRAKE_SOFT_RELEASE,
+   INTENT_ARM_LIMIT
 };
 
 enum IntentStatus
@@ -247,6 +336,56 @@ datetime      g_tomb_expires              = 0;
 double        g_lease_token               = 0.0;
 string        g_lease_owner_key           = "";
 string        g_lease_heartbeat_key       = "";
+
+// Telemetry rebuild throttle and per-run identity. g_run_id lets rows from
+// separate Strategy Tester runs be separated even when they append to one file.
+bool          g_telemetry_dirty           = true;
+int           g_telemetry_last_positions  = -1;
+int           g_telemetry_last_orders     = -1;
+string        g_run_id                    = "";
+
+// Signal probe: one non-overlapping observation at a time, so recorded hit
+// rates are independent samples rather than correlated overlapping windows.
+bool          g_probe_active              = false;
+int           g_probe_direction           = 0;
+double        g_probe_entry_mid           = 0.0;
+double        g_probe_target_mid          = 0.0;
+double        g_probe_stop_mid            = 0.0;
+long          g_probe_open_msc            = 0;
+double        g_probe_score               = 0.0;
+double        g_probe_f1                  = 0.0;
+double        g_probe_f2                  = 0.0;
+double        g_probe_f3                  = 0.0;
+double        g_probe_f4                  = 0.0;
+double        g_probe_spread              = 0.0;
+ulong         g_probe_sequence            = 0;
+int           g_pending_entry_direction   = 0;
+
+int           g_ema_fast_fast_handle      = INVALID_HANDLE;
+int           g_ema_slow_fast_handle      = INVALID_HANDLE;
+int           g_ema_fast_slow_handle      = INVALID_HANDLE;
+int           g_ema_slow_slow_handle      = INVALID_HANDLE;
+int           g_atr_handle                = INVALID_HANDLE;
+bool          g_breakeven_armed           = false;
+
+// Stacking four gates can silently admit almost nothing, so every rejection is
+// attributed. Without this you cannot tell which gate starved the run.
+#define REJ_SPREAD     0
+#define REJ_STABILITY  1
+#define REJ_SAMPLES    2
+#define REJ_SCORE      3
+#define REJ_VELOCITY   4
+#define REJ_MTF        5
+#define REJ_ATR        6
+#define REJ_SPIKE      7
+#define REJ_COOLDOWN   8
+#define REJ_SESSION    9
+#define REJ_ADMITTED   10
+#define REJ_SLOTS      11
+ulong         g_reject_counts[REJ_SLOTS];
+ulong         g_spike_block_until_msc     = 0;
+// Cross-cycle: a full stop ends the cycle, so this must outlive ClearCycleState.
+datetime      g_post_loss_cooldown_until  = 0;
 
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
@@ -457,6 +596,8 @@ void PersistState()
    GlobalVariableSet(StateKey("intent_byvol"),    g_intent_target_by_volume);
    GlobalVariableSet(StateKey("intent_time"),     (double)g_intent_submitted_at);
    GlobalVariableSet(StateKey("quarantine"),      (double)g_quarantine_until);
+   GlobalVariableSet(StateKey("be_armed"),        (g_breakeven_armed ? 1.0 : 0.0));
+   GlobalVariableSet(StateKey("loss_cooldown"),   (double)g_post_loss_cooldown_until);
    GlobalVariableSet(StateKey("tomb_op"),         (double)g_tomb_operation);
    GlobalVariableSet(StateKey("tomb_role"),       (double)g_tomb_role);
    GlobalVariableSet(StateKey("tomb_volume"),     g_tomb_expected_volume);
@@ -553,6 +694,10 @@ void LoadState()
       g_intent_submitted_at = (datetime)GlobalVariableGet(StateKey("intent_time"));
    if(GlobalVariableCheck(StateKey("quarantine")))
       g_quarantine_until = (datetime)GlobalVariableGet(StateKey("quarantine"));
+   if(GlobalVariableCheck(StateKey("be_armed")))
+      g_breakeven_armed = (GlobalVariableGet(StateKey("be_armed")) > 0.5);
+   if(GlobalVariableCheck(StateKey("loss_cooldown")))
+      g_post_loss_cooldown_until = (datetime)GlobalVariableGet(StateKey("loss_cooldown"));
    g_intent_cycle = LoadUlong("intent_cycle");
    g_intent_generation = LoadUlong("intent_gen");
    g_intent_request_id = LoadUlong("intent_request");
@@ -722,6 +867,10 @@ void ClearCycleState()
    g_latch_position_count    = 0;
    g_latch_order_count       = 0;
    g_latch_phase             = PHASE_FLAT;
+   g_telemetry_dirty         = true;
+   g_telemetry_last_positions = -1;
+   g_telemetry_last_orders   = -1;
+   g_breakeven_armed         = false;
    PersistState();
 }
 
@@ -873,7 +1022,12 @@ void RefreshSnapshot()
       ulong observed_generation = 0;
       const PositionRole role = ParseIntentCommentEx(OrderGetString(ORDER_COMMENT), observed_cycle,
                                                       observed_generation);
-      if(role != ROLE_BRAKE || !AdoptOrValidateCycle(observed_cycle))
+      // Dual mode only ever rests a brake stop. Single mode additionally rests a
+      // passive entry limit carrying an initial role.
+      const bool role_allowed = (role == ROLE_BRAKE ||
+                                 (SingleLegMode() &&
+                                  (role == ROLE_INITIAL_BUY || role == ROLE_INITIAL_SELL)));
+      if(!role_allowed || !AdoptOrValidateCycle(observed_cycle))
          g_snapshot_invalid = true;
 
       OrderRecord record;
@@ -966,6 +1120,23 @@ int FindBrakeOrderIndex()
 {
    for(int index = 0; index < g_order_count; ++index)
       if(g_orders[index].role == ROLE_BRAKE)
+         return index;
+   return -1;
+}
+
+int EntryOrderCount()
+{
+   int count = 0;
+   for(int index = 0; index < g_order_count; ++index)
+      if(g_orders[index].role == ROLE_INITIAL_BUY || g_orders[index].role == ROLE_INITIAL_SELL)
+         ++count;
+   return count;
+}
+
+int FindEntryOrderIndex()
+{
+   for(int index = 0; index < g_order_count; ++index)
+      if(g_orders[index].role == ROLE_INITIAL_BUY || g_orders[index].role == ROLE_INITIAL_SELL)
          return index;
    return -1;
 }
@@ -1182,6 +1353,7 @@ string ResolveReasonName(const ResolveReason reason)
    if(reason == RESOLVE_LEDGER_ESCAPE)  return "RESOLVE_LEDGER_ESCAPE";
    if(reason == RESOLVE_RUNTIME_INVALID)return "RESOLVE_RUNTIME_INVALID";
    if(reason == RESOLVE_FRICTION_CAP)   return "RESOLVE_FRICTION_CAP";
+   if(reason == RESOLVE_STALE_EXIT)     return "RESOLVE_STALE_EXIT";
    return "RESOLVE_NONE";
 }
 
@@ -1424,7 +1596,7 @@ bool OpenTelemetryFile(int &handle)
    }
    if(FileSize(handle) == 0)
    {
-      FileWrite(handle, "schema", "event_id", "event", "time", "cycle_id", "reason", "phase",
+      FileWrite(handle, "schema", "run_id", "event_id", "event", "time", "cycle_id", "reason", "phase",
                 "cycle_start", "cycle_end", "duration_seconds", "liquidation_at_latch",
                 "final_net", "gross_profit", "commission", "swap", "fee", "exit_overshoot",
                 "realized_at_latch", "floating_at_latch", "exit_commission_at_latch",
@@ -1448,11 +1620,11 @@ bool WriteTelemetryEvent(const string event_name, const datetime event_time,
    if(!OpenTelemetryFile(handle))
       return false;
 
-   const string event_id = StringFormat("%I64u-%s", g_cycle_id, event_name);
+   const string event_id = StringFormat("%s-%I64u-%s", g_run_id, g_cycle_id, event_name);
    const double final_net = g_cycle_gross_profit + g_cycle_commission + g_cycle_swap + g_cycle_fee;
    const long duration = (g_cycle_start > 0 ? (long)(event_time - g_cycle_start) : 0);
    const double overshoot = (completed ? final_net - g_latch_liquidation : 0.0);
-   const uint written = FileWrite(handle, "FX2-CYCLE-V2", event_id, event_name,
+   const uint written = FileWrite(handle, "FX2-CYCLE-V3", g_run_id, event_id, event_name,
                                   TimeToString(event_time, TIME_DATE | TIME_SECONDS), g_cycle_id,
                                   ResolveReasonName(g_resolve_reason), CyclePhaseName(g_latch_phase),
                                   TimeToString(g_cycle_start, TIME_DATE | TIME_SECONDS),
@@ -1699,8 +1871,8 @@ bool SendMarketOpen(const ENUM_ORDER_TYPE type, const double volume, const Posit
    request.deviation    = InpMaxDeviationPoints;
    request.type_filling = MarketFillingMode();
    request.comment      = IntentComment(role);
-   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * InpAnchorServerStopPips * pip);
-   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip);
+   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
+   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * TargetPips() * pip);
    return SubmitRequest(request, "Market open " + RoleCode(role), true, operation, role);
 }
 
@@ -1761,6 +1933,104 @@ bool SendBrakeStop(const int anchor_index)
       PersistState();
    }
    return accepted;
+}
+
+// Passive directional entry. BUY LIMIT rests at/below Bid, SELL LIMIT at/above
+// Ask, clamped so the broker's stops level cannot reject it.
+bool SendLimitEntry(const int direction)
+{
+   if(direction == 0)
+      return false;
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   const double pip = PipSize();
+   const double stops = BrokerStopLevelPips() * pip;
+   const bool buy = (direction > 0);
+   double price;
+   if(buy)
+   {
+      const double passive = tick.bid - InpLimitOffsetPips * pip;
+      const double cap = tick.ask - stops;           // must rest below the market
+      price = NormalizePriceDown(MathMin(passive, cap));
+      if(price >= tick.ask)
+         return false;
+   }
+   else
+   {
+      const double passive = tick.ask + InpLimitOffsetPips * pip;
+      const double floor_price = tick.bid + stops;   // must rest above the market
+      price = NormalizePriceUp(MathMax(passive, floor_price));
+      if(price <= tick.bid)
+         return false;
+   }
+
+   const PositionRole role = (buy ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL);
+   MqlTradeRequest request;
+   ZeroMemory(request);
+   request.action       = TRADE_ACTION_PENDING;
+   request.magic        = (ulong)InpMagic;
+   request.symbol       = _Symbol;
+   request.volume       = InpLots;
+   request.type         = (buy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT);
+   request.price        = price;
+   request.type_filling = ORDER_FILLING_RETURN;
+   request.type_time    = ORDER_TIME_GTC;
+   request.comment      = IntentComment(role);
+   request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
+   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * TargetPips() * pip);
+
+   const bool accepted = SubmitRequest(request, "Passive entry limit " + RoleCode(role), true,
+                                       INTENT_ARM_LIMIT, role);
+   if(accepted)
+   {
+      g_arming_first_order = g_last_result_order;
+      PersistState();
+   }
+   return accepted;
+}
+
+// True when a resting entry limit should be withdrawn: it has aged out, or the
+// market has run away from it so the signal that placed it is stale.
+bool EntryLimitShouldCancel(const OrderRecord &order, string &reason)
+{
+   reason = "";
+   const double pip = PipSize();
+   const long now_msc = (g_last_tick.time_msc > 0 ? g_last_tick.time_msc : 0);
+   if(now_msc > 0 && order.setup_time_msc > 0 &&
+      now_msc - order.setup_time_msc >= (long)InpLimitTimeoutMs)
+   {
+      reason = "timeout";
+      return true;
+   }
+
+   // Runaway: price advanced past the limit in the signal's own direction, so
+   // filling now would mean buying into a move that already happened.
+   const bool buy = (order.type == ORDER_TYPE_BUY_LIMIT);
+   const double distance = (buy ? (g_last_tick.ask - order.open_price)
+                                : (order.open_price - g_last_tick.bid)) / pip;
+   if(distance >= InpLimitCancelDistancePips)
+   {
+      reason = "runaway";
+      return true;
+   }
+   return false;
+}
+
+bool HandleEntryLimitLifecycle()
+{
+   if(!SingleLegMode() || !InpUseLimitEntry)
+      return false;
+   const int index = FindEntryOrderIndex();
+   if(index < 0)
+      return false;
+
+   string reason = "";
+   if(!EntryLimitShouldCancel(g_orders[index], reason))
+      return false;
+   return DeleteOrderTicket(g_orders[index].ticket,
+                            "Entry limit cancel (" + reason + ")", INTENT_DELETE_ORDER);
 }
 
 bool SendMarketBrake(const int anchor_index)
@@ -1928,10 +2198,18 @@ double DynamicSpreadLimitPips()
 
 bool CurrentTickEntryAdmissible()
 {
+   // Quote sanity and staleness are never negotiable: acting on a crossed or
+   // stale quote is a correctness failure, not a throttle.
    if(g_last_tick.ask <= g_last_tick.bid || g_last_tick.bid <= 0.0)
       return false;
    if(GetTickCount64() - g_last_tick_local_msc > InpEntryQuoteMaxAgeMs)
       return false;
+
+   // Directive 1/4: no background throttling in single mode. The stability and
+   // spread filters below are dual-mode controls and are bypassed unless
+   // explicitly re-enabled.
+   if(SingleLegMode() && !InpUseMicrostructureGate)
+      return true;
 
    const double spread = (g_last_tick.ask - g_last_tick.bid) / PipSize();
    if(spread > DynamicSpreadLimitPips())
@@ -1995,15 +2273,521 @@ bool CanReduceRisk()
    return (mode == SYMBOL_TRADE_MODE_FULL || mode == SYMBOL_TRADE_MODE_CLOSEONLY);
 }
 
+// -----------------------------------------------------------------------------
+// Directional signal engine (Option B)
+// -----------------------------------------------------------------------------
+
+struct SignalFeatures
+{
+   double slope_pips;            // f1 EWMA(fast) - EWMA(slow)
+   double breakout_pips;         // f2 excursion beyond the preceding range
+   double imbalance;             // f3 (up - down) / total, in [-1, +1]
+   double velocity_pips_100ms;   // f4 realised path per 100 ms
+   double score;
+   int    direction;             // +1 buy, -1 sell, 0 none
+   int    samples;
+   bool   valid;
+};
+
+bool SingleLegMode()
+{
+   return (InpEntryMode == ENTRY_DIRECTIONAL_SINGLE);
+}
+
+// Structural stop for an open position. Dual mode keeps the 50-pip catastrophe
+// stop; single mode uses the tight directional stop as its primary risk control.
+// Value of one pip for InpLots in ACCOUNT currency (GBP), from live tick value.
+double PipValueAccount()
+{
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = TickSize();
+   if(tick_value <= 0.0 || tick_size <= 0.0)
+      return 0.0;
+   return tick_value * (PipSize() / tick_size) * InpLots;
+}
+
+double StructuralStopPips()
+{
+   if(!SingleLegMode())
+      return InpAnchorServerStopPips;
+   const double pip_value = PipValueAccount();
+   if(pip_value <= 0.0)
+      return InpAnchorServerStopPips;         // fail safe: never unprotected
+   return InpDirectionalStopGBP / pip_value;
+}
+
+double TargetPips()
+{
+   if(!SingleLegMode())
+      return InpTakeProfitPips;
+   const double pip_value = PipValueAccount();
+   if(pip_value <= 0.0)
+      return InpTakeProfitPips;
+   return InpDirectionalTakeProfitGBP / pip_value;
+}
+
+double BrokerStopLevelPips()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) *
+          SymbolInfoDouble(_Symbol, SYMBOL_POINT) / PipSize();
+}
+
+// Multi-timeframe EMA alignment. Both timeframes must agree with the tick
+// signal, which is what rejects counter-trend exhaustion entries.
+int MtfBias()
+{
+   if(!InpUseMtfConfirmation)
+      return 0;
+   double f1[], s1[], f2[], s2[];
+   if(CopyBuffer(g_ema_fast_fast_handle, 0, 0, 1, f1) != 1 ||
+      CopyBuffer(g_ema_slow_fast_handle, 0, 0, 1, s1) != 1 ||
+      CopyBuffer(g_ema_fast_slow_handle, 0, 0, 1, f2) != 1 ||
+      CopyBuffer(g_ema_slow_slow_handle, 0, 0, 1, s2) != 1)
+      return 0;                              // data not ready: no confirmation
+   if(f1[0] > s1[0] && f2[0] > s2[0])
+      return 1;
+   if(f1[0] < s1[0] && f2[0] < s2[0])
+      return -1;
+   return 0;
+}
+
+// Requires genuine volatility expansion, not just a nonzero ATR.
+bool VolatilityBurstOk(double &atr_pips, double &ratio)
+{
+   atr_pips = 0.0;
+   ratio = 0.0;
+   if(!InpUseVolatilityBurst)
+      return true;
+   double atr[];
+   const int wanted = InpAtrPeriod + 1;
+   if(CopyBuffer(g_atr_handle, 0, 0, wanted, atr) != wanted)
+      return false;
+   const double pip = PipSize();
+   atr_pips = atr[wanted - 1] / pip;          // CopyBuffer returns oldest-first
+   double sum = 0.0;
+   for(int index = 0; index < wanted - 1; ++index)
+      sum += atr[index];
+   const double baseline = (wanted > 1 ? sum / (wanted - 1) / pip : 0.0);
+   ratio = (baseline > 0.0 ? atr_pips / baseline : 0.0);
+   if(atr_pips < InpMinAtrPips)
+      return false;
+   return (ratio >= InpAtrExpansionRatio);
+}
+
+// Desired stop for a position, including the latched breakeven trail. The
+// protection reconciler uses this, so the trail and the reconciler cannot fight
+// each other and generate an endless modify loop.
+double DesiredStopPrice(const PositionRecord &position)
+{
+   const double pip = PipSize();
+   const bool buy = (position.type == POSITION_TYPE_BUY);
+   double stop = position.open_price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip;
+
+   if(InpUseBreakevenTrail && SingleLegMode() && g_breakeven_armed)
+   {
+      const double breakeven = position.open_price +
+                               (buy ? 1.0 : -1.0) * InpBreakevenOffsetPips * pip;
+      const double candidate = (buy ? MathMax(stop, breakeven) : MathMin(stop, breakeven));
+      // A stop inside the broker freeze/stops band is rejected, and a rejected
+      // modify escalates to RESOLVE_INVARIANT. Only move it if it is legal.
+      const double guard = MathMax(BrokerStopLevelPips(), 0.1) * pip;
+      const double market = (buy ? g_last_tick.bid : g_last_tick.ask);
+      const bool legal = (buy ? (candidate <= market - guard)
+                              : (candidate >= market + guard));
+      if(legal)
+         stop = candidate;
+   }
+   return NormalizePriceNearest(stop);
+}
+
+// Latches the breakeven trail once, so a retrace can never walk the stop back.
+void UpdateBreakevenLatch()
+{
+   if(!InpUseBreakevenTrail || !SingleLegMode() || g_breakeven_armed)
+      return;
+   const int index = FindAnchorIndex();
+   if(index < 0)
+      return;
+   const PositionRecord position = g_positions[index];
+   const double pip = PipSize();
+   const double favourable = (position.type == POSITION_TYPE_BUY
+                              ? (g_last_tick.bid - position.open_price)
+                              : (position.open_price - g_last_tick.ask)) / pip;
+   if(favourable >= InpBreakevenTriggerPips)
+   {
+      g_breakeven_armed = true;
+      PrintFormat("Breakeven trail armed: cycle=%I64u favourable=%.2f pips",
+                  g_cycle_id, favourable);
+      PersistState();
+   }
+}
+
+// One pass over the tick ring buffer. All four features are derived from the
+// same window set, so no indicator, bar history or look-ahead is involved.
+bool ComputeSignalFeatures(SignalFeatures &out)
+{
+   out.slope_pips = 0.0;
+   out.breakout_pips = 0.0;
+   out.imbalance = 0.0;
+   out.velocity_pips_100ms = 0.0;
+   out.score = 0.0;
+   out.direction = 0;
+   out.samples = 0;
+   out.valid = false;
+
+   const double pip = PipSize();
+   if(pip <= 0.0 || g_sample_count <= 0 || g_last_tick.time_msc <= 0)
+      return false;
+
+   const long newest = g_last_tick.time_msc;
+   const long widest = (long)MathMax(InpSignalSlowMs,
+                          MathMax(InpBreakoutWindowMs, InpImbalanceWindowMs));
+   const double tau_fast = (double)InpSignalFastMs;
+   const double tau_slow = (double)InpSignalSlowMs;
+
+   double fast_num = 0.0, fast_den = 0.0, slow_num = 0.0, slow_den = 0.0;
+   double range_high = 0.0, range_low = 0.0;
+   bool   range_seen = false;
+   int    up_ticks = 0, down_ticks = 0;
+   double abs_path = 0.0;
+   long   path_span = 0;
+   double previous_mid = 0.0;
+   bool   previous_seen = false;
+   const double mid_now = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   int    samples = 0;
+
+   for(int offset = 0; offset < g_sample_count; ++offset)
+   {
+      int index = g_sample_next - 1 - offset;
+      if(index < 0)
+         index += MAX_TICK_SAMPLES;
+      const long age = newest - g_samples[index].time_msc;
+      if(age < 0 || age > widest)
+         break;
+
+      const double mid = g_samples[index].mid;
+      ++samples;
+
+      const double w_fast = MathExp(-(double)age / MathMax(1.0, tau_fast));
+      const double w_slow = MathExp(-(double)age / MathMax(1.0, tau_slow));
+      fast_num += mid * w_fast; fast_den += w_fast;
+      slow_num += mid * w_slow; slow_den += w_slow;
+
+      // Breakout range excludes the newest sample so "now" can exceed it.
+      if(offset > 0 && age <= (long)InpBreakoutWindowMs)
+      {
+         if(!range_seen) { range_high = mid; range_low = mid; range_seen = true; }
+         else { range_high = MathMax(range_high, mid); range_low = MathMin(range_low, mid); }
+      }
+
+      if(age <= (long)InpImbalanceWindowMs)
+      {
+         if(previous_seen)
+         {
+            // Iterating newest-first, so previous_mid is the LATER tick.
+            if(previous_mid > mid)      ++up_ticks;
+            else if(previous_mid < mid) ++down_ticks;
+            abs_path += MathAbs(previous_mid - mid);
+            path_span = age;
+         }
+         previous_mid = mid;
+         previous_seen = true;
+      }
+   }
+
+   out.samples = samples;
+   if(samples < (int)MathMax(3, InpProbeMinSamples) || fast_den <= 0.0 || slow_den <= 0.0)
+      return false;
+
+   out.slope_pips = ((fast_num / fast_den) - (slow_num / slow_den)) / pip;
+
+   if(range_seen)
+   {
+      if(mid_now > range_high)      out.breakout_pips = (mid_now - range_high) / pip;
+      else if(mid_now < range_low)  out.breakout_pips = (mid_now - range_low) / pip;
+   }
+
+   const int total_ticks = up_ticks + down_ticks;
+   if(total_ticks > 0)
+      out.imbalance = (double)(up_ticks - down_ticks) / (double)total_ticks;
+
+   if(path_span > 0)
+      out.velocity_pips_100ms = (abs_path / pip) / ((double)path_span / 100.0);
+
+   out.score = InpWeightSlope * out.slope_pips +
+               InpWeightBreakout * out.breakout_pips +
+               InpWeightImbalance * out.imbalance;
+   if(out.score > 0.0)      out.direction = 1;
+   else if(out.score < 0.0) out.direction = -1;
+   out.valid = true;
+   return true;
+}
+
+// Spike / abnormal-jump shield. Detects the largest mid excursion inside the
+// window and a spread explosion. This only blocks NEW entries; positions
+// already open keep their server stop and are never abandoned mid-spike.
+bool AbnormalMarket(double &max_delta_pips, double &spread_pips)
+{
+   const double pip = PipSize();
+   max_delta_pips = 0.0;
+   spread_pips = (g_last_tick.ask > g_last_tick.bid
+                  ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
+   if(!InpUseSpikeShield)
+      return false;
+
+   if(spread_pips > InpSpikeSpreadPips)
+      return true;
+
+   const long newest = g_last_tick.time_msc;
+   double high = 0.0, low = 0.0;
+   bool seen = false;
+   for(int offset = 0; offset < g_sample_count; ++offset)
+   {
+      int index = g_sample_next - 1 - offset;
+      if(index < 0)
+         index += MAX_TICK_SAMPLES;
+      const long age = newest - g_samples[index].time_msc;
+      if(age < 0 || age > (long)InpSpikeWindowMs)
+         break;
+      const double mid = g_samples[index].mid;
+      if(!seen) { high = mid; low = mid; seen = true; }
+      else      { high = MathMax(high, mid); low = MathMin(low, mid); }
+   }
+   if(seen)
+      max_delta_pips = (high - low) / pip;
+   return (max_delta_pips > InpSpikeTickDeltaPips);
+}
+
+// Returns +1 / -1 when an admissible momentum-aligned entry exists, else 0.
+// Every rejection is attributed so a starved run can be diagnosed.
+int DirectionalBias(SignalFeatures &features)
+{
+   // Spike shield first: it is the only permitted reason to pause entry.
+   double spike_delta = 0.0, spike_spread = 0.0;
+   if(AbnormalMarket(spike_delta, spike_spread))
+   {
+      g_spike_block_until_msc = GetTickCount64() + InpSpikeCooldownMs;
+      ++g_reject_counts[REJ_SPIKE];
+      return 0;
+   }
+   if(InpUseSpikeShield && GetTickCount64() < g_spike_block_until_msc)
+   {
+      ++g_reject_counts[REJ_SPIKE];
+      return 0;
+   }
+
+   const double pip = PipSize();
+   const double spread_pips = (g_last_tick.ask > g_last_tick.bid
+                               ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
+   if(InpUseSpreadGate && spread_pips > InpSignalSpreadMaxPips)
+   {
+      ++g_reject_counts[REJ_SPREAD];
+      return 0;
+   }
+   if(!ComputeSignalFeatures(features))
+   {
+      ++g_reject_counts[REJ_SAMPLES];
+      return 0;
+   }
+   // Micro-bias mode: continuous minute-by-minute participation. Direction is
+   // the raw sign of the micro-slope, with no magnitude or velocity threshold.
+   if(InpUseMicroBiasOnly)
+   {
+      if(features.slope_pips > 0.0)      features.direction = 1;
+      else if(features.slope_pips < 0.0) features.direction = -1;
+      else
+      {
+         ++g_reject_counts[REJ_SCORE];
+         return 0;
+      }
+   }
+   else
+   {
+      if(features.velocity_pips_100ms < InpMinVelocityPips100ms)
+      {
+         ++g_reject_counts[REJ_VELOCITY];
+         return 0;
+      }
+      if(MathAbs(features.score) < InpMinSignalScore)
+      {
+         ++g_reject_counts[REJ_SCORE];
+         return 0;
+      }
+   }
+
+   double atr_pips = 0.0, atr_ratio = 0.0;
+   if(!VolatilityBurstOk(atr_pips, atr_ratio))
+   {
+      ++g_reject_counts[REJ_ATR];
+      return 0;
+   }
+
+   if(InpUseMtfConfirmation)
+   {
+      const int mtf = MtfBias();
+      if(mtf == 0 || mtf != features.direction)
+      {
+         ++g_reject_counts[REJ_MTF];
+         return 0;
+      }
+   }
+
+   ++g_reject_counts[REJ_ADMITTED];
+   return features.direction;
+}
+
+void LogGateAttribution()
+{
+   if(!SingleLegMode())
+      return;
+   ulong total = 0;
+   for(int index = 0; index < REJ_SLOTS; ++index)
+      total += g_reject_counts[index];
+   if(total == 0)
+   {
+      Print("Gate attribution: no entry evaluations occurred.");
+      return;
+   }
+   PrintFormat("Gate attribution over %I64u evaluations: spread=%I64u stability=%I64u "
+               "samples=%I64u score=%I64u velocity=%I64u atr=%I64u mtf=%I64u spike=%I64u "
+               "cooldown=%I64u session=%I64u ADMITTED=%I64u (%.3f%%)",
+               total, g_reject_counts[REJ_SPREAD], g_reject_counts[REJ_STABILITY],
+               g_reject_counts[REJ_SAMPLES], g_reject_counts[REJ_SCORE],
+               g_reject_counts[REJ_VELOCITY], g_reject_counts[REJ_ATR],
+               g_reject_counts[REJ_MTF], g_reject_counts[REJ_SPIKE],
+               g_reject_counts[REJ_COOLDOWN], g_reject_counts[REJ_SESSION],
+               g_reject_counts[REJ_ADMITTED],
+               (double)g_reject_counts[REJ_ADMITTED] / (double)total * 100.0);
+}
+
+string ProbeFileName()
+{
+   return StringFormat("%s_%I64d_%s_%I64d_signal.csv", InpTelemetryFilePrefix,
+                       AccountInfoInteger(ACCOUNT_LOGIN), _Symbol, InpMagic);
+}
+
+void WriteProbeRow(const string outcome, const long elapsed_msc, const double exit_mid)
+{
+   if(!InpTelemetryEnabled)
+      return;
+   int handle = FileOpen(ProbeFileName(), FILE_READ | FILE_WRITE | FILE_CSV |
+                         FILE_ANSI | FILE_COMMON | FILE_SHARE_READ, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      PrintFormat("Probe FileOpen failed: %s error=%d", ProbeFileName(), GetLastError());
+      return;
+   }
+   if(FileSize(handle) == 0)
+      FileWrite(handle, "schema", "run_id", "probe_id", "open_time", "direction",
+                "score", "f1_slope_pips", "f2_breakout_pips", "f3_imbalance",
+                "f4_velocity_pips_100ms", "spread_pips", "entry_mid", "target_mid",
+                "stop_mid", "exit_mid", "outcome", "elapsed_ms");
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle, "FX2-SIGNAL-V1", g_run_id, g_probe_sequence,
+             TimeToString((datetime)(g_probe_open_msc / 1000), TIME_DATE | TIME_SECONDS),
+             g_probe_direction, g_probe_score, g_probe_f1, g_probe_f2, g_probe_f3,
+             g_probe_f4, g_probe_spread, g_probe_entry_mid, g_probe_target_mid,
+             g_probe_stop_mid, exit_mid, outcome, elapsed_msc);
+   FileFlush(handle);
+   FileClose(handle);
+}
+
+// Opens a probe observation at the current signal, if none is outstanding.
+void OpenProbe(const SignalFeatures &features, const int direction)
+{
+   if(g_probe_active || direction == 0)
+      return;
+   const double pip = PipSize();
+   const double mid = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   const double spread_pips = (g_last_tick.ask - g_last_tick.bid) / pip;
+
+   // Both distances are expressed as MARKET movement, matching what the TP and
+   // the structural stop actually require once the spread is paid on entry.
+   const double target_move = (TargetPips() + spread_pips) * pip;
+   const double stop_move = MathMax(pip * 0.1,
+                                    (StructuralStopPips() - spread_pips) * pip);
+
+   g_probe_active = true;
+   ++g_probe_sequence;
+   g_probe_direction = direction;
+   g_probe_entry_mid = mid;
+   g_probe_target_mid = mid + direction * target_move;
+   g_probe_stop_mid = mid - direction * stop_move;
+   g_probe_open_msc = g_last_tick.time_msc;
+   g_probe_score = features.score;
+   g_probe_f1 = features.slope_pips;
+   g_probe_f2 = features.breakout_pips;
+   g_probe_f3 = features.imbalance;
+   g_probe_f4 = features.velocity_pips_100ms;
+   g_probe_spread = spread_pips;
+}
+
+// Resolves the outstanding observation on the current tick.
+void ResolveProbe()
+{
+   if(!g_probe_active)
+      return;
+   const double mid = 0.5 * (g_last_tick.bid + g_last_tick.ask);
+   const long elapsed = g_last_tick.time_msc - g_probe_open_msc;
+   bool hit_target = false;
+   bool hit_stop = false;
+   if(g_probe_direction > 0)
+   {
+      hit_target = (mid >= g_probe_target_mid);
+      hit_stop = (mid <= g_probe_stop_mid);
+   }
+   else
+   {
+      hit_target = (mid <= g_probe_target_mid);
+      hit_stop = (mid >= g_probe_stop_mid);
+   }
+   if(!hit_target && !hit_stop)
+      return;
+   // A tick that straddles both levels is recorded conservatively as a stop.
+   WriteProbeRow((hit_stop ? "STOP" : "TARGET"), elapsed, mid);
+   g_probe_active = false;
+}
+
 bool StrictEntryGate()
 {
+   g_pending_entry_direction = 0;
    if(!g_entry_config_valid || !CanOpenRisk())
       return false;
    if(g_position_count != 0 || g_order_count != 0 || g_cycle_id != 0)
       return false;
-   if(g_entry_admissible_ticks < 3)
+   // The 3-consecutive-tick run is part of the microstructure throttle.
+   const int required_ticks = ((SingleLegMode() && !InpUseMicrostructureGate) ? 1 : 3);
+   if(g_entry_admissible_ticks < required_ticks)
       return false;
-   return CurrentTickEntryAdmissible();
+   if(!CurrentTickEntryAdmissible())
+      return false;
+
+   // Anti-cascade: pause after a full stop so a sudden micro-trend cannot be
+   // re-entered repeatedly. Only delays entry; never touches an open position.
+   if(PostLossCooldownActive())
+   {
+      ++g_reject_counts[REJ_COOLDOWN];
+      return false;
+   }
+   if(InWeekOpenQuietWindow())
+   {
+      ++g_reject_counts[REJ_SESSION];
+      return false;
+   }
+
+   if(!SingleLegMode())
+      return true;
+
+   // Probe mode measures the signal without ever creating exposure.
+   if(InpProbeMode)
+      return false;
+
+   SignalFeatures features;
+   const int direction = DirectionalBias(features);
+   if(direction == 0)
+      return false;
+   g_pending_entry_direction = direction;
+   return true;
 }
 
 int FridaySessionCloseSecond()
@@ -2100,10 +2884,27 @@ void UpdateCyclePathTelemetry()
 {
    if(g_cycle_id == 0)
       return;
+
+   // Tracking the adverse excursion is cheap and must happen on every tick.
    const double adverse = AnchorAdversePips();
    if(adverse > g_cycle_max_adverse_pips)
       g_cycle_max_adverse_pips = adverse;
-   RebuildCycleTelemetry();
+
+   // Rebuilding from deal history is not cheap and only changes when inventory
+   // changes or a deal arrives. Rescanning on every tick of a month-long run is
+   // pure waste, and the friction counters cannot move without one of those
+   // events, so throttling here is behaviourally identical.
+   if(g_position_count != g_telemetry_last_positions ||
+      g_order_count != g_telemetry_last_orders)
+      g_telemetry_dirty = true;
+   if(!g_telemetry_dirty)
+      return;
+   if(RebuildCycleTelemetry())
+   {
+      g_telemetry_dirty = false;
+      g_telemetry_last_positions = g_position_count;
+      g_telemetry_last_orders = g_order_count;
+   }
 }
 
 bool FrictionCapReached()
@@ -2112,6 +2913,57 @@ bool FrictionCapReached()
             g_soft_release_count >= InpMaxSoftReleasesPerCycle) ||
            (InpMaxBrakeRealizedLossGBP > 0.0 &&
             g_brake_realized_loss_gbp + 1.0e-8 >= InpMaxBrakeRealizedLossGBP));
+}
+
+// Time-decay exit: a position that has aged past the stale window AND is still
+// floating negative is closed at market rather than waiting for the full stop.
+// Winners are untouched, so the TP path is unchanged.
+bool StaleNegativePositionExists()
+{
+   if(InpStaleTradeExitMinutes == 0)
+      return false;
+   const datetime now = TimeTradeServer();
+   const datetime limit = (datetime)InpStaleTradeExitMinutes * 60;
+   for(int index = 0; index < g_position_count; ++index)
+   {
+      const PositionRecord position = g_positions[index];
+      if(position.open_time <= 0 || now - position.open_time < limit)
+         continue;
+      if(position.profit + position.swap < 0.0)
+         return true;
+   }
+   return false;
+}
+
+bool PostLossCooldownActive()
+{
+   return (InpPostLossCooldownMinutes > 0 && g_post_loss_cooldown_until > 0 &&
+           TimeTradeServer() < g_post_loss_cooldown_until);
+}
+
+// Illiquidity fence for the first minutes of the trading week. Uses the symbol's
+// own first session of the day so broker timezones need no hardcoding.
+bool InWeekOpenQuietWindow()
+{
+   if(InpMondayOpenQuietMinutes == 0)
+      return false;
+   MqlDateTime now_parts;
+   TimeToStruct(TimeTradeServer(), now_parts);
+   const ENUM_DAY_OF_WEEK today = (ENUM_DAY_OF_WEEK)now_parts.day_of_week;
+   if(today != SUNDAY && today != MONDAY)
+      return false;
+
+   datetime from_time = 0;
+   datetime to_time = 0;
+   if(!SymbolInfoSessionTrade(_Symbol, today, 0, from_time, to_time))
+      return false;
+
+   MqlDateTime start_parts;
+   TimeToStruct(from_time, start_parts);
+   const long start_second = (long)start_parts.hour * 3600 + (long)start_parts.min * 60 + start_parts.sec;
+   const long now_second = (long)now_parts.hour * 3600 + (long)now_parts.min * 60 + now_parts.sec;
+   const long quiet = (long)InpMondayOpenQuietMinutes * 60;
+   return (now_second >= start_second && now_second < start_second + quiet);
 }
 
 bool MaximumAnchorAgeReached()
@@ -2159,6 +3011,13 @@ bool InventoryShapeValid()
    const int base_count = BasePositionCount();
    const int brake_count = BrakePositionCount();
    const int brake_orders = BrakeOrderCount();
+   const int entry_orders = EntryOrderCount();
+
+   // Single mode: a resting passive entry limit is the one legal order while
+   // flat. Never both an entry limit and a live position.
+   if(SingleLegMode() && entry_orders > 0)
+      return (entry_orders == 1 && g_order_count == 1 && g_position_count == 0);
+
    if(base_count + brake_count != g_position_count || brake_orders != g_order_count)
       return false;
 
@@ -2175,6 +3034,8 @@ bool InventoryShapeValid()
 
    if(base_count == 2)
    {
+      if(SingleLegMode())
+         return false;               // two base legs is never valid in single mode
       if(brake_count != 0 || brake_orders != 0 || g_position_count != 2)
          return false;
       bool have_buy_role = false;
@@ -2194,6 +3055,9 @@ bool InventoryShapeValid()
       const int anchor_index = FindAnchorIndex();
       if(anchor_index < 0 || !VolumeEqual(g_positions[anchor_index].volume, InpLots))
          return false;
+      // Single-leg mode: exactly one base position, never a brake or brake order.
+      if(SingleLegMode())
+         return (brake_count == 0 && brake_orders == 0 && g_position_count == 1);
       const PositionRecord anchor = g_positions[anchor_index];
       for(int index = 0; index < g_position_count; ++index)
          if(g_positions[index].role == ROLE_BRAKE && g_positions[index].type == anchor.type)
@@ -2522,7 +3386,41 @@ bool ReconcileOutstandingIntent()
 
    if(g_intent_operation == INTENT_MODIFY_PROTECTION)
    {
-      if(g_intent_status == INTENT_STATUS_ACCEPTED && IntentAgeReached(InpSettlementQuietMs))
+      // Instant chaining removes the TIME-based wait. A protection change has no
+      // inventory to reconcile, so once the broker has accepted it there is
+      // nothing left to confirm and the slot can be freed on the same tick.
+      const uint settle = (InpInstantChaining ? 0 : InpSettlementQuietMs);
+      if(g_intent_status == INTENT_STATUS_ACCEPTED && IntentAgeReached(settle))
+      {
+         ClearIntent();
+         return false;
+      }
+   }
+   else if(g_intent_operation == INTENT_ARM_LIMIT)
+   {
+      // Live resting order, or a fill that already produced the position, both
+      // settle the request. A terminal unfilled order ends the cycle so the next
+      // tick can arm a fresh one against a fresh signal.
+      if(current_order != 0)
+      {
+         g_arming_first_order = current_order;
+         ClearIntent();
+         return false;
+      }
+      if(visible_volume > VolumeTolerance())
+      {
+         if(history_order != 0)
+            g_arming_first_order = history_order;
+         ClearIntent();
+         return false;
+      }
+      if(terminal_unfilled)
+      {
+         ClearIntent();
+         ClearCycleState();
+         return false;
+      }
+      if(complete_round_trip)
       {
          ClearIntent();
          return false;
@@ -2599,6 +3497,11 @@ bool ReconcileOutstandingIntent()
    else if(g_intent_operation == INTENT_CLOSE_POSITION ||
            g_intent_operation == INTENT_BRAKE_SOFT_RELEASE)
    {
+      // This is already causal, not time-based: the instant the closed position
+      // leaves the broker snapshot the slot frees, so chaining is same-tick.
+      // The barrier itself must stay -- without it an unconfirmed close can be
+      // followed by a new entry, producing two live positions in single mode and
+      // an immediate RESOLVE_INVARIANT flatten.
       const double current_volume = CurrentPositionVolumeByTicket(g_intent_target_ticket);
       const bool disappeared = (current_volume <= VolumeTolerance());
       const bool reduced = (current_volume + VolumeTolerance() < g_intent_target_volume);
@@ -2723,8 +3626,8 @@ ProtectionResult EnsurePositionProtection(const PositionRecord &position, const 
 {
    const double pip = PipSize();
    const bool buy = (position.type == POSITION_TYPE_BUY);
-   const double desired_sl = NormalizePriceNearest(position.open_price + (buy ? -1.0 : 1.0) * InpAnchorServerStopPips * pip);
-   const double desired_tp = (remove_tp ? 0.0 : NormalizePriceNearest(position.open_price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip));
+   const double desired_sl = DesiredStopPrice(position);
+   const double desired_tp = (remove_tp ? 0.0 : NormalizePriceNearest(position.open_price + (buy ? 1.0 : -1.0) * TargetPips() * pip));
 
    const bool tp_wrong = (remove_tp ? position.tp != 0.0 : !NearlyEqual(position.tp, desired_tp));
    if(NearlyEqual(position.sl, desired_sl) && !tp_wrong)
@@ -2744,7 +3647,9 @@ ProtectionResult ReconcileProtectionOneAction()
    // A confirmed anchor has TP=0 before a pending or live brake exists.
    // During PHASE_ARMING the first leg retains its original TP while the
    // opposite initial leg is still being submitted.
-   if(anchor_index >= 0 && g_phase != PHASE_ARMING)
+   // In single-leg mode there is no partner and no brake: the lone position IS
+   // the trade, so it must keep its 2.5-pip TP.
+   if(anchor_index >= 0 && g_phase != PHASE_ARMING && !SingleLegMode())
    {
       const ProtectionResult anchor_result = EnsurePositionProtection(g_positions[anchor_index], true);
       if(anchor_result != PROTECTION_UNCHANGED)
@@ -2763,7 +3668,7 @@ ProtectionResult ReconcileProtectionOneAction()
       }
    }
 
-   if(BasePositionCount() == 2)
+   if(BasePositionCount() == 2 || SingleLegMode())
    {
       for(int index = 0; index < g_position_count; ++index)
       {
@@ -2855,9 +3760,16 @@ bool ReconcileArmingTerminal()
 
    // Crash before PREPARED was flushed means OrderSend was never called. With
    // no broker inventory and no intent/order id it is safe to resume leg one.
+   // Single mode never replays: it clears and re-arms from a fresh signal, which
+   // is both safer and what rapid-fire chaining wants.
    if(g_position_count == 0 && g_order_count == 0 && !HasOutstandingIntent() &&
       g_arming_first_order == 0)
    {
+      if(SingleLegMode())
+      {
+         ClearCycleState();
+         return true;
+      }
       const bool buy_first = ((g_cycle_id % 2) == 0);
       if(SendMarketOpen((buy_first ? ORDER_TYPE_BUY : ORDER_TYPE_SELL), InpLots,
                         (buy_first ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL),
@@ -2871,7 +3783,14 @@ bool ReconcileArmingTerminal()
       return true;
    }
 
-   if(TimeTradeServer() - g_cycle_start < 5)
+   // A resting entry limit is a legitimate arming state, not a stalled one.
+   if(SingleLegMode() && EntryOrderCount() > 0)
+      return false;
+
+   // The 5-second settle is a dual-mode safeguard; it would stall rapid-fire
+   // chaining, and in single mode the order state is already causally terminal.
+   const int settle_seconds = ((SingleLegMode() && InpInstantChaining) ? 0 : 5);
+   if(TimeTradeServer() - g_cycle_start < settle_seconds)
       return false;
 
    bool filled = false;
@@ -2902,6 +3821,21 @@ bool ReconcileArmingTerminal()
 
 bool HandleArmingCompletion()
 {
+   // Single-leg mode never submits an opposite initial leg; the confirmed first
+   // fill completes the cycle structure immediately.
+   if(SingleLegMode())
+   {
+      if(g_phase == PHASE_ARMING && BasePositionCount() == 1)
+      {
+         g_phase = PHASE_ANCHOR;
+         if(g_anchor_since == 0)
+            g_anchor_since = TimeTradeServer();
+         g_arming_second_sent = false;
+         PersistState();
+      }
+      return false;
+   }
+
    if(g_phase != PHASE_ARMING || BasePositionCount() != 1 || g_position_count != 1 || g_order_count != 0)
       return false;
 
@@ -2942,12 +3876,63 @@ bool HandleArmingCompletion()
    return false;
 }
 
+// Resolves the stop trigger price that created this brake. Market-fallback
+// brakes have no trigger, so the fill price remains the only valid reference.
+bool BrakeStopTriggerPrice(const PositionRecord &brake, double &trigger)
+{
+   trigger = 0.0;
+   if(brake.identifier == 0)
+      return false;
+   const datetime from_time = (g_cycle_start > 0 ? g_cycle_start - 300
+                                                 : TimeTradeServer() - 86400);
+   if(!HistorySelect(from_time, TimeTradeServer() + 60))
+      return false;
+
+   const int deal_total = HistoryDealsTotal();
+   for(int index = 0; index < deal_total; ++index)
+   {
+      const ulong deal = HistoryDealGetTicket(index);
+      if(deal == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != brake.identifier)
+         continue;
+      const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_IN && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      const ulong order = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+      if(order == 0 || !HistoryOrderSelect(order))
+         continue;
+      const ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(order, ORDER_TYPE);
+      if(order_type != ORDER_TYPE_BUY_STOP && order_type != ORDER_TYPE_SELL_STOP)
+         continue;
+      const double price = HistoryOrderGetDouble(order, ORDER_PRICE_OPEN);
+      if(price <= 0.0)
+         continue;
+      trigger = price;
+      return true;
+   }
+   return false;
+}
+
+double BrakeReleaseReferencePrice(const PositionRecord &brake)
+{
+   if(InpBrakeReleaseReference == RELEASE_FROM_TRIGGER)
+   {
+      double trigger = 0.0;
+      if(BrakeStopTriggerPrice(brake, trigger))
+         return trigger;
+   }
+   return brake.open_price;
+}
+
 bool BrakeSoftReleaseTriggered(const PositionRecord &brake)
 {
    const double distance = InpBrakeSoftReleasePips * PipSize();
+   const double reference = BrakeReleaseReferencePrice(brake);
    if(brake.type == POSITION_TYPE_BUY)
-      return (g_last_tick.bid <= brake.open_price - distance);
-   return (g_last_tick.ask >= brake.open_price + distance);
+      return (g_last_tick.bid <= reference - distance);
+   return (g_last_tick.ask >= reference + distance);
 }
 
 bool HandleBrakeLifecycle()
@@ -3113,7 +4098,29 @@ bool ArmFreshCycle()
    g_arming_second_order = 0;
    PersistState();
 
-   const bool buy_first = ((g_cycle_id % 2) == 0);
+   // Dual mode alternates which side is submitted first to remove broker
+   // sequencing bias. Single mode takes its side from the momentum signal.
+   bool buy_first = ((g_cycle_id % 2) == 0);
+   if(SingleLegMode())
+   {
+      if(g_pending_entry_direction == 0)
+      {
+         ClearCycleState();
+         return false;
+      }
+      buy_first = (g_pending_entry_direction > 0);
+   }
+
+   if(SingleLegMode() && InpUseLimitEntry)
+   {
+      if(!SendLimitEntry(g_pending_entry_direction))
+      {
+         ClearCycleState();
+         return false;
+      }
+      return true;
+   }
+
    const bool accepted = SendMarketOpen((buy_first ? ORDER_TYPE_BUY : ORDER_TYPE_SELL), InpLots,
                                         (buy_first ? ROLE_INITIAL_BUY : ROLE_INITIAL_SELL),
                                         INTENT_ARM_FIRST);
@@ -3152,6 +4159,7 @@ void Drive()
       return;
    }
    UpdateCyclePathTelemetry();
+   UpdateBreakevenLatch();
 
    const bool active_cycle = (g_position_count > 0 || g_order_count > 0 ||
                               g_cycle_id != 0 || HasOutstandingIntent() || HasTimedOutTombstone() ||
@@ -3268,12 +4276,11 @@ void Drive()
       return;
    }
 
-   // P2.5: completed soft-release churn immediately resolves the entire cycle.
-   // This check precedes all brake maintenance, so no successor brake can be
-   // armed after the count or realized-loss boundary becomes visible.
-   if(active_cycle && FrictionCapReached())
+   // P2.7: stagnation exit. Sits with the other time-based exits so it cannot be
+   // overtaken by brake or entry maintenance.
+   if(active_cycle && StaleNegativePositionExists())
    {
-      LatchResolution(RESOLVE_FRICTION_CAP);
+      LatchResolution(RESOLVE_STALE_EXIT);
       FlattenOneAction();
       g_drive_busy = false;
       return;
@@ -3311,15 +4318,21 @@ void Drive()
    // A failed second arming leg converges to a provisional anchor.
    InferPhase();
 
-   // P4: soft distance and soft cash reset.
-   if(FindAnchorIndex() >= 0 && AnchorAdversePips() >= InpPolicyResetPips)
+   // P4: soft distance and soft cash reset. The distance reset is a dual-mode
+   // control; in single mode the structural stop is far tighter and binds first.
+   if(!SingleLegMode() && FindAnchorIndex() >= 0 && AnchorAdversePips() >= InpPolicyResetPips)
    {
       LatchResolution(RESOLVE_SOFT_DISTANCE);
       FlattenOneAction();
       g_drive_busy = false;
       return;
    }
-   if(active_cycle && liquidation <= -InpSoftCycleLossGBP)
+   // Soft cash is a dual-mode BASKET control. In single mode the position's own
+   // server stop is the risk limit, and a GBP 3.00 stop plus exit commission and
+   // reserves reaches -3.37, which would trip a 3.24 soft cap and market-close
+   // the trade BEFORE its own stop. That would silently override the mandated
+   // geometry, so the soft cap is suppressed; the hard budget still bounds it.
+   if(!SingleLegMode() && active_cycle && liquidation <= -InpSoftCycleLossGBP)
    {
       LatchResolution(RESOLVE_SOFT_CASH);
       FlattenOneAction();
@@ -3336,6 +4349,20 @@ void Drive()
       return;
    }
 
+   // P5.5: completed soft-release churn resolves the whole cycle. This sits
+   // AFTER ledger escape so a cycle that is already at or above the escape
+   // target is attributed to RESOLVE_LEDGER_ESCAPE rather than being mislabelled
+   // as friction churn, and BEFORE all brake maintenance so no successor brake
+   // can be armed once either boundary is visible. Both orderings flatten at
+   // the same price, so cycle P/L is unchanged; only the attribution differs.
+   if(active_cycle && FrictionCapReached())
+   {
+      LatchResolution(RESOLVE_FRICTION_CAP);
+      FlattenOneAction();
+      g_drive_busy = false;
+      return;
+   }
+
    // P6: live brake TP is server-side; reversal release is EA-managed.
    if(HandleBrakeLifecycle())
    {
@@ -3345,7 +4372,10 @@ void Drive()
    }
 
    // P7: immutable pending brake and cancel-confirm-market fallback.
-   if(g_phase != PHASE_ARMING && FindAnchorIndex() >= 0 && BasePositionCount() == 1 &&
+   // Single-leg mode has no stranded anchor to hedge: the tight structural stop
+   // is the risk control, so no brake is ever armed.
+   if(!SingleLegMode() &&
+      g_phase != PHASE_ARMING && FindAnchorIndex() >= 0 && BasePositionCount() == 1 &&
       BrakePositionVolume() + VolumeTolerance() < g_positions[FindAnchorIndex()].volume)
    {
       if(HandlePendingBrake())
@@ -3354,6 +4384,14 @@ void Drive()
          g_drive_busy = false;
          return;
       }
+   }
+
+   // P7.5: withdraw a stale or overtaken passive entry limit.
+   if(HandleEntryLimitLifecycle())
+   {
+      PersistState();
+      g_drive_busy = false;
+      return;
    }
 
    // P8: only a fully flat, order-free cycle may arm a fresh symmetric pair.
@@ -3427,12 +4465,80 @@ bool ValidateStaticConfiguration()
                   InpTakeProfitPips, min_stop_pips);
       return false;
    }
+   if(SingleLegMode())
+   {
+      const double pip_value = PipValueAccount();
+      if(pip_value <= 0.0)
+      {
+         Print("Initialization failed: cannot resolve pip value; cash targets are unusable.");
+         return false;
+      }
+      const double tp_pips = TargetPips();
+      const double sl_pips = StructuralStopPips();
+      if(tp_pips <= min_stop_pips || sl_pips <= min_stop_pips)
+      {
+         PrintFormat("Initialization failed: directional TP %.2f / stop %.2f pips must exceed "
+                     "broker stop level %.2f pips.", tp_pips, sl_pips, min_stop_pips);
+         return false;
+      }
+      if(InpBreakevenTriggerPips >= tp_pips)
+      {
+         PrintFormat("Initialization failed: breakeven trigger %.2f pips must be inside the "
+                     "%.2f-pip target.", InpBreakevenTriggerPips, tp_pips);
+         return false;
+      }
+      // The hard budget must still be able to contain one full stop plus the
+      // costs of closing it, otherwise the catastrophe net would fire first and
+      // pre-empt the mandated stop.
+      const double worst = InpDirectionalStopGBP + InpLots * InpExitCommissionPerLotGBP +
+                           InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP;
+      if(InpHardCycleLossGBP <= worst)
+      {
+         PrintFormat("Initialization failed: InpHardCycleLossGBP (%.2f) must exceed the worst "
+                     "single-trade liquidation of %.2f GBP (stop %.2f + costs).",
+                     InpHardCycleLossGBP, worst, InpDirectionalStopGBP);
+         return false;
+      }
+      PrintFormat("Single-leg geometry: TP %.2f GBP = %.2f pips | stop %.2f GBP = %.2f pips | "
+                  "pip value %.4f GBP", InpDirectionalTakeProfitGBP, tp_pips,
+                  InpDirectionalStopGBP, sl_pips, pip_value);
+   }
+
+   // The flatten window must be nested inside the no-new-risk window. If it is
+   // wider, P2 latches RESOLVE_FRIDAY and flattens, ClearCycleState() clears the
+   // latch, then P8 sees itself outside the narrower no-risk window and arms a
+   // fresh pair, which P2 flattens again -- an arm/flatten loop that burns
+   // commission and spread on every iteration until the session closes.
+   if(InpNoNewRiskBeforeCloseMinutes < InpFridayFlattenMinutes)
+   {
+      PrintFormat("Initialization failed: InpNoNewRiskBeforeCloseMinutes (%u) must be >= "
+                  "InpFridayFlattenMinutes (%u) to prevent Friday arm/flatten cycles.",
+                  InpNoNewRiskBeforeCloseMinutes, InpFridayFlattenMinutes);
+      return false;
+   }
 
    if(InpLots <= 0.0 || InpTakeProfitPips <= 0.0 || InpAnchorServerStopPips <= 0.0 ||
       InpPolicyResetPips <= 0.0 || InpPolicyResetPips >= InpAnchorServerStopPips ||
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
       InpEmergencySlippageReserveGBP < 0.0 || InpUnlinkedChargeReserveGBP < 0.0 ||
       InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP >= InpHardCycleLossGBP ||
+      InpDirectionalTakeProfitGBP <= 0.0 || InpDirectionalStopGBP <= 0.0 ||
+      InpDirectionalTakeProfitGBP >= InpDirectionalStopGBP * 10.0 ||
+      InpSignalSpreadMaxPips <= 0.0 ||
+      InpMtfFastEmaPeriod < 1 || InpMtfSlowEmaPeriod <= InpMtfFastEmaPeriod ||
+      InpAtrPeriod < 2 || InpMinAtrPips < 0.0 || InpAtrExpansionRatio < 1.0 ||
+      InpBreakevenTriggerPips <= 0.0 || InpBreakevenOffsetPips < 0.0 ||
+      InpSpikeTickDeltaPips <= 0.0 || InpSpikeSpreadPips <= 0.0 ||
+      InpSpikeWindowMs == 0 || InpSpikeWindowMs > 60000 ||
+      InpLimitOffsetPips < 0.0 || InpLimitTimeoutMs == 0 ||
+      InpLimitCancelDistancePips <= 0.0 ||
+      InpStaleTradeExitMinutes > 1440 || InpPostLossCooldownMinutes > 1440 ||
+      InpMondayOpenQuietMinutes > 1440 ||
+      InpMinSignalScore <= 0.0 ||
+      InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
+      InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
+      InpImbalanceWindowMs == 0 || InpProbeMinSamples < 3 ||
+      InpSignalSlowMs > MAX_TICK_SAMPLES * 1000 ||
       InpBrakeOffsetPips <= 0.0 || InpBrakeSoftReleasePips <= 0.0 ||
       InpBrakeRearmAdvancePips <= 0.0 || InpMaxSoftReleasesPerCycle == 0 ||
       InpMaxBrakeRealizedLossGBP <= 0.0 || StringLen(InpTelemetryFilePrefix) == 0 ||
@@ -3462,6 +4568,21 @@ int OnInit()
       Print("Initialization failed: persistence key exceeds terminal limit.");
       return INIT_FAILED;
    }
+
+   // Strategy Tester runs share the terminal's Global Variable space, so state
+   // from a previous run (cycle, watermark, friction counters, and the instance
+   // lease) can leak into the next one. Replaying different date ranges back to
+   // back would then inherit a stale watermark/counter set, and a lease whose
+   // heartbeat sits in another run's simulated time can even fail OnInit. A
+   // backtest must always start from a clean slate; live state is untouched.
+   g_run_id = StringFormat("%s#%I64u", TimeToString(TimeTradeServer(), TIME_DATE),
+                           GetTickCount64() % 100000);
+   if((bool)MQLInfoInteger(MQL_TESTER))
+   {
+      GlobalVariablesDeleteAll(g_global_prefix);
+      PrintFormat("Tester run %s: cleared persisted state for prefix %s", g_run_id, g_global_prefix);
+   }
+
    if(!AcquireInstanceLease())
    {
       Print("Initialization failed: another EA instance owns this account/symbol/magic lease.");
@@ -3504,6 +4625,35 @@ int OnInit()
       PersistState();
    }
 
+   ArrayInitialize(g_reject_counts, 0);
+   if(SingleLegMode())
+   {
+      if(InpUseMtfConfirmation)
+      {
+         g_ema_fast_fast_handle = iMA(_Symbol, InpMtfFastTimeframe, InpMtfFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_slow_fast_handle = iMA(_Symbol, InpMtfFastTimeframe, InpMtfSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_fast_slow_handle = iMA(_Symbol, InpMtfSlowTimeframe, InpMtfFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_slow_slow_handle = iMA(_Symbol, InpMtfSlowTimeframe, InpMtfSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_ema_fast_fast_handle == INVALID_HANDLE || g_ema_slow_fast_handle == INVALID_HANDLE ||
+            g_ema_fast_slow_handle == INVALID_HANDLE || g_ema_slow_slow_handle == INVALID_HANDLE)
+         {
+            PrintFormat("Initialization failed: EMA handle creation failed, error=%d", GetLastError());
+            ReleaseInstanceLease();
+            return INIT_FAILED;
+         }
+      }
+      if(InpUseVolatilityBurst)
+      {
+         g_atr_handle = iATR(_Symbol, InpAtrTimeframe, InpAtrPeriod);
+         if(g_atr_handle == INVALID_HANDLE)
+         {
+            PrintFormat("Initialization failed: ATR handle creation failed, error=%d", GetLastError());
+            ReleaseInstanceLease();
+            return INIT_FAILED;
+         }
+      }
+   }
+
    if(!EventSetMillisecondTimer((int)InpTimerPeriodMs))
    {
       PrintFormat("Millisecond timer unavailable, error=%d; attempting one-second safety timer", GetLastError());
@@ -3520,8 +4670,14 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   LogGateAttribution();
    PersistState();
    ReleaseInstanceLease();
+   if(g_ema_fast_fast_handle != INVALID_HANDLE) IndicatorRelease(g_ema_fast_fast_handle);
+   if(g_ema_slow_fast_handle != INVALID_HANDLE) IndicatorRelease(g_ema_slow_fast_handle);
+   if(g_ema_fast_slow_handle != INVALID_HANDLE) IndicatorRelease(g_ema_fast_slow_handle);
+   if(g_ema_slow_slow_handle != INVALID_HANDLE) IndicatorRelease(g_ema_slow_slow_handle);
+   if(g_atr_handle != INVALID_HANDLE)           IndicatorRelease(g_atr_handle);
    EventKillTimer();
    PrintFormat("EA deinitialized, reason=%d", reason);
 }
@@ -3536,6 +4692,21 @@ void OnTick()
       ++g_entry_admissible_ticks;
    else
       g_entry_admissible_ticks = 0;
+
+   // Signal probe runs in single mode regardless of whether the EA is trading,
+   // so one replay yields both execution results and forward-outcome samples.
+   if(SingleLegMode())
+   {
+      ResolveProbe();
+      if(!g_probe_active && g_entry_admissible_ticks >= 3 && CurrentTickEntryAdmissible())
+      {
+         SignalFeatures features;
+         const int direction = DirectionalBias(features);
+         if(direction != 0)
+            OpenProbe(features, direction);
+      }
+   }
+
    Drive();
 }
 
@@ -3567,6 +4738,41 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
          if(g_intent_deal_ticket == 0 && transaction.deal != 0)
             g_intent_deal_ticket = transaction.deal;
          PersistState();
+      }
+   }
+
+   // A new deal is the only event that can move the friction counters without an
+   // inventory-count change, so it must invalidate the telemetry cache.
+   if(transaction.type == TRADE_TRANSACTION_DEAL_ADD)
+      g_telemetry_dirty = true;
+
+   // Arm the post-loss cooldown only on a genuine full stop. DEAL_REASON_SL also
+   // fires for a breakeven-trail exit, which costs about spread+commission, so
+   // the magnitude is what separates the two. Half the configured stop is well
+   // above any breakeven exit and well below a full one.
+   if(InpPostLossCooldownMinutes > 0 && transaction.type == TRADE_TRANSACTION_DEAL_ADD &&
+      transaction.deal != 0 && HistoryDealSelect(transaction.deal))
+   {
+      const ulong deal = transaction.deal;
+      if((long)HistoryDealGetInteger(deal, DEAL_MAGIC) == InpMagic &&
+         HistoryDealGetString(deal, DEAL_SYMBOL) == _Symbol)
+      {
+         const ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+         {
+            const double net = HistoryDealGetDouble(deal, DEAL_PROFIT) +
+                               HistoryDealGetDouble(deal, DEAL_COMMISSION) +
+                               HistoryDealGetDouble(deal, DEAL_SWAP) +
+                               HistoryDealGetDouble(deal, DEAL_FEE);
+            if(net <= -(InpDirectionalStopGBP * 0.5))
+            {
+               g_post_loss_cooldown_until = TimeTradeServer() +
+                                            (datetime)InpPostLossCooldownMinutes * 60;
+               PrintFormat("Post-loss cooldown armed: deal net %.2f GBP, entries paused until %s",
+                           net, TimeToString(g_post_loss_cooldown_until, TIME_DATE | TIME_SECONDS));
+               PersistState();
+            }
+         }
       }
    }
 
