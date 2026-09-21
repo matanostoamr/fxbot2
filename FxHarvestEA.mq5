@@ -73,7 +73,12 @@ input EntryMode InpEntryMode                  = ENTRY_DIRECTIONAL_SINGLE;
 // hit rate can be measured before any capital logic depends on it. When false
 // the EA trades AND still writes probe rows, so one replay yields both datasets.
 input bool   InpProbeMode                     = false;
-input double InpDirectionalStopPips            = 2.0;   // structural stop, single mode
+// Geometry for single mode only; dual mode keeps its validated 2.5/50 values so
+// ENTRY_DUAL remains a bit-for-bit rollback. Symmetric 3.0/3.0 is chosen because
+// a fixed 0.64-pip commission means TIGHTENING the stop RAISES the required win
+// rate: 2.5/1.5 needs +28.5 points over a coin flip, 3.0/3.0 needs +19.0.
+input double InpDirectionalTakeProfitPips      = 3.0;
+input double InpDirectionalStopPips            = 3.0;
 input double InpMinSignalScore                 = 0.60;
 input double InpMinVelocityPips100ms           = 0.05;
 input uint   InpSignalFastMs                   = 300;
@@ -84,6 +89,23 @@ input double InpWeightSlope                    = 1.0;
 input double InpWeightBreakout                 = 1.0;
 input double InpWeightImbalance                = 1.0;
 input uint   InpProbeMinSamples                = 8;
+
+// --- Accuracy upgrades. Each is independently switchable so its contribution
+// --- can be measured in isolation rather than as a bundle.
+input double InpSignalSpreadMaxPips            = 0.30;  // strict compression gate
+input bool   InpUseMtfConfirmation             = true;
+input ENUM_TIMEFRAMES InpMtfFastTimeframe      = PERIOD_M1;
+input ENUM_TIMEFRAMES InpMtfSlowTimeframe      = PERIOD_M5;
+input int    InpMtfFastEmaPeriod               = 8;
+input int    InpMtfSlowEmaPeriod               = 21;
+input bool   InpUseVolatilityBurst             = true;
+input ENUM_TIMEFRAMES InpAtrTimeframe          = PERIOD_M1;
+input int    InpAtrPeriod                      = 14;
+input double InpMinAtrPips                     = 1.0;
+input double InpAtrExpansionRatio              = 1.10;
+input bool   InpUseBreakevenTrail              = true;
+input double InpBreakevenTriggerPips           = 1.5;
+input double InpBreakevenOffsetPips            = 0.0;   // 0 = entry price
 
 // The engine deliberately uses synchronous OrderSend calls and then reconciles
 // broker inventory. Request acceptance is never treated as fill confirmation.
@@ -310,6 +332,26 @@ double        g_probe_spread              = 0.0;
 ulong         g_probe_sequence            = 0;
 int           g_pending_entry_direction   = 0;
 
+int           g_ema_fast_fast_handle      = INVALID_HANDLE;
+int           g_ema_slow_fast_handle      = INVALID_HANDLE;
+int           g_ema_fast_slow_handle      = INVALID_HANDLE;
+int           g_ema_slow_slow_handle      = INVALID_HANDLE;
+int           g_atr_handle                = INVALID_HANDLE;
+bool          g_breakeven_armed           = false;
+
+// Stacking four gates can silently admit almost nothing, so every rejection is
+// attributed. Without this you cannot tell which gate starved the run.
+#define REJ_SPREAD     0
+#define REJ_STABILITY  1
+#define REJ_SAMPLES    2
+#define REJ_SCORE      3
+#define REJ_VELOCITY   4
+#define REJ_MTF        5
+#define REJ_ATR        6
+#define REJ_ADMITTED   7
+#define REJ_SLOTS      8
+ulong         g_reject_counts[REJ_SLOTS];
+
 // Phase 1/2 policy and telemetry state. All fields are persisted and rebuilt
 // from owned deal history where possible, so terminal restarts neither reset
 // the friction budget nor double-count completed events.
@@ -519,6 +561,7 @@ void PersistState()
    GlobalVariableSet(StateKey("intent_byvol"),    g_intent_target_by_volume);
    GlobalVariableSet(StateKey("intent_time"),     (double)g_intent_submitted_at);
    GlobalVariableSet(StateKey("quarantine"),      (double)g_quarantine_until);
+   GlobalVariableSet(StateKey("be_armed"),        (g_breakeven_armed ? 1.0 : 0.0));
    GlobalVariableSet(StateKey("tomb_op"),         (double)g_tomb_operation);
    GlobalVariableSet(StateKey("tomb_role"),       (double)g_tomb_role);
    GlobalVariableSet(StateKey("tomb_volume"),     g_tomb_expected_volume);
@@ -615,6 +658,8 @@ void LoadState()
       g_intent_submitted_at = (datetime)GlobalVariableGet(StateKey("intent_time"));
    if(GlobalVariableCheck(StateKey("quarantine")))
       g_quarantine_until = (datetime)GlobalVariableGet(StateKey("quarantine"));
+   if(GlobalVariableCheck(StateKey("be_armed")))
+      g_breakeven_armed = (GlobalVariableGet(StateKey("be_armed")) > 0.5);
    g_intent_cycle = LoadUlong("intent_cycle");
    g_intent_generation = LoadUlong("intent_gen");
    g_intent_request_id = LoadUlong("intent_request");
@@ -787,6 +832,7 @@ void ClearCycleState()
    g_telemetry_dirty         = true;
    g_telemetry_last_positions = -1;
    g_telemetry_last_orders   = -1;
+   g_breakeven_armed         = false;
    PersistState();
 }
 
@@ -1765,7 +1811,7 @@ bool SendMarketOpen(const ENUM_ORDER_TYPE type, const double volume, const Posit
    request.type_filling = MarketFillingMode();
    request.comment      = IntentComment(role);
    request.sl           = NormalizePriceNearest(price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
-   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip);
+   request.tp           = NormalizePriceNearest(price + (buy ? 1.0 : -1.0) * TargetPips() * pip);
    return SubmitRequest(request, "Market open " + RoleCode(role), true, operation, role);
 }
 
@@ -2088,6 +2134,107 @@ double StructuralStopPips()
    return (SingleLegMode() ? InpDirectionalStopPips : InpAnchorServerStopPips);
 }
 
+double TargetPips()
+{
+   return (SingleLegMode() ? InpDirectionalTakeProfitPips : InpTakeProfitPips);
+}
+
+double BrokerStopLevelPips()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) *
+          SymbolInfoDouble(_Symbol, SYMBOL_POINT) / PipSize();
+}
+
+// Multi-timeframe EMA alignment. Both timeframes must agree with the tick
+// signal, which is what rejects counter-trend exhaustion entries.
+int MtfBias()
+{
+   if(!InpUseMtfConfirmation)
+      return 0;
+   double f1[], s1[], f2[], s2[];
+   if(CopyBuffer(g_ema_fast_fast_handle, 0, 0, 1, f1) != 1 ||
+      CopyBuffer(g_ema_slow_fast_handle, 0, 0, 1, s1) != 1 ||
+      CopyBuffer(g_ema_fast_slow_handle, 0, 0, 1, f2) != 1 ||
+      CopyBuffer(g_ema_slow_slow_handle, 0, 0, 1, s2) != 1)
+      return 0;                              // data not ready: no confirmation
+   if(f1[0] > s1[0] && f2[0] > s2[0])
+      return 1;
+   if(f1[0] < s1[0] && f2[0] < s2[0])
+      return -1;
+   return 0;
+}
+
+// Requires genuine volatility expansion, not just a nonzero ATR.
+bool VolatilityBurstOk(double &atr_pips, double &ratio)
+{
+   atr_pips = 0.0;
+   ratio = 0.0;
+   if(!InpUseVolatilityBurst)
+      return true;
+   double atr[];
+   const int wanted = InpAtrPeriod + 1;
+   if(CopyBuffer(g_atr_handle, 0, 0, wanted, atr) != wanted)
+      return false;
+   const double pip = PipSize();
+   atr_pips = atr[wanted - 1] / pip;          // CopyBuffer returns oldest-first
+   double sum = 0.0;
+   for(int index = 0; index < wanted - 1; ++index)
+      sum += atr[index];
+   const double baseline = (wanted > 1 ? sum / (wanted - 1) / pip : 0.0);
+   ratio = (baseline > 0.0 ? atr_pips / baseline : 0.0);
+   if(atr_pips < InpMinAtrPips)
+      return false;
+   return (ratio >= InpAtrExpansionRatio);
+}
+
+// Desired stop for a position, including the latched breakeven trail. The
+// protection reconciler uses this, so the trail and the reconciler cannot fight
+// each other and generate an endless modify loop.
+double DesiredStopPrice(const PositionRecord &position)
+{
+   const double pip = PipSize();
+   const bool buy = (position.type == POSITION_TYPE_BUY);
+   double stop = position.open_price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip;
+
+   if(InpUseBreakevenTrail && SingleLegMode() && g_breakeven_armed)
+   {
+      const double breakeven = position.open_price +
+                               (buy ? 1.0 : -1.0) * InpBreakevenOffsetPips * pip;
+      const double candidate = (buy ? MathMax(stop, breakeven) : MathMin(stop, breakeven));
+      // A stop inside the broker freeze/stops band is rejected, and a rejected
+      // modify escalates to RESOLVE_INVARIANT. Only move it if it is legal.
+      const double guard = MathMax(BrokerStopLevelPips(), 0.1) * pip;
+      const double market = (buy ? g_last_tick.bid : g_last_tick.ask);
+      const bool legal = (buy ? (candidate <= market - guard)
+                              : (candidate >= market + guard));
+      if(legal)
+         stop = candidate;
+   }
+   return NormalizePriceNearest(stop);
+}
+
+// Latches the breakeven trail once, so a retrace can never walk the stop back.
+void UpdateBreakevenLatch()
+{
+   if(!InpUseBreakevenTrail || !SingleLegMode() || g_breakeven_armed)
+      return;
+   const int index = FindAnchorIndex();
+   if(index < 0)
+      return;
+   const PositionRecord position = g_positions[index];
+   const double pip = PipSize();
+   const double favourable = (position.type == POSITION_TYPE_BUY
+                              ? (g_last_tick.bid - position.open_price)
+                              : (position.open_price - g_last_tick.ask)) / pip;
+   if(favourable >= InpBreakevenTriggerPips)
+   {
+      g_breakeven_armed = true;
+      PrintFormat("Breakeven trail armed: cycle=%I64u favourable=%.2f pips",
+                  g_cycle_id, favourable);
+      PersistState();
+   }
+}
+
 // One pass over the tick ring buffer. All four features are derived from the
 // same window set, so no indicator, bar history or look-ahead is involved.
 bool ComputeSignalFeatures(SignalFeatures &out)
@@ -2190,15 +2337,73 @@ bool ComputeSignalFeatures(SignalFeatures &out)
 }
 
 // Returns +1 / -1 when an admissible momentum-aligned entry exists, else 0.
+// Every rejection is attributed so a starved run can be diagnosed.
 int DirectionalBias(SignalFeatures &features)
 {
+   const double pip = PipSize();
+   const double spread_pips = (g_last_tick.ask > g_last_tick.bid
+                               ? (g_last_tick.ask - g_last_tick.bid) / pip : 999.0);
+   if(spread_pips > InpSignalSpreadMaxPips)
+   {
+      ++g_reject_counts[REJ_SPREAD];
+      return 0;
+   }
    if(!ComputeSignalFeatures(features))
+   {
+      ++g_reject_counts[REJ_SAMPLES];
       return 0;
+   }
    if(features.velocity_pips_100ms < InpMinVelocityPips100ms)
+   {
+      ++g_reject_counts[REJ_VELOCITY];
       return 0;
+   }
    if(MathAbs(features.score) < InpMinSignalScore)
+   {
+      ++g_reject_counts[REJ_SCORE];
       return 0;
+   }
+
+   double atr_pips = 0.0, atr_ratio = 0.0;
+   if(!VolatilityBurstOk(atr_pips, atr_ratio))
+   {
+      ++g_reject_counts[REJ_ATR];
+      return 0;
+   }
+
+   if(InpUseMtfConfirmation)
+   {
+      const int mtf = MtfBias();
+      if(mtf == 0 || mtf != features.direction)
+      {
+         ++g_reject_counts[REJ_MTF];
+         return 0;
+      }
+   }
+
+   ++g_reject_counts[REJ_ADMITTED];
    return features.direction;
+}
+
+void LogGateAttribution()
+{
+   if(!SingleLegMode())
+      return;
+   ulong total = 0;
+   for(int index = 0; index < REJ_SLOTS; ++index)
+      total += g_reject_counts[index];
+   if(total == 0)
+   {
+      Print("Gate attribution: no entry evaluations occurred.");
+      return;
+   }
+   PrintFormat("Gate attribution over %I64u evaluations: spread=%I64u stability=%I64u "
+               "samples=%I64u score=%I64u velocity=%I64u atr=%I64u mtf=%I64u ADMITTED=%I64u (%.3f%%)",
+               total, g_reject_counts[REJ_SPREAD], g_reject_counts[REJ_STABILITY],
+               g_reject_counts[REJ_SAMPLES], g_reject_counts[REJ_SCORE],
+               g_reject_counts[REJ_VELOCITY], g_reject_counts[REJ_ATR],
+               g_reject_counts[REJ_MTF], g_reject_counts[REJ_ADMITTED],
+               (double)g_reject_counts[REJ_ADMITTED] / (double)total * 100.0);
 }
 
 string ProbeFileName()
@@ -2244,7 +2449,7 @@ void OpenProbe(const SignalFeatures &features, const int direction)
 
    // Both distances are expressed as MARKET movement, matching what the TP and
    // the structural stop actually require once the spread is paid on entry.
-   const double target_move = (InpTakeProfitPips + spread_pips) * pip;
+   const double target_move = (TargetPips() + spread_pips) * pip;
    const double stop_move = MathMax(pip * 0.1,
                                     (StructuralStopPips() - spread_pips) * pip);
 
@@ -3055,8 +3260,8 @@ ProtectionResult EnsurePositionProtection(const PositionRecord &position, const 
 {
    const double pip = PipSize();
    const bool buy = (position.type == POSITION_TYPE_BUY);
-   const double desired_sl = NormalizePriceNearest(position.open_price + (buy ? -1.0 : 1.0) * StructuralStopPips() * pip);
-   const double desired_tp = (remove_tp ? 0.0 : NormalizePriceNearest(position.open_price + (buy ? 1.0 : -1.0) * InpTakeProfitPips * pip));
+   const double desired_sl = DesiredStopPrice(position);
+   const double desired_tp = (remove_tp ? 0.0 : NormalizePriceNearest(position.open_price + (buy ? 1.0 : -1.0) * TargetPips() * pip));
 
    const bool tp_wrong = (remove_tp ? position.tp != 0.0 : !NearlyEqual(position.tp, desired_tp));
    if(NearlyEqual(position.sl, desired_sl) && !tp_wrong)
@@ -3564,6 +3769,7 @@ void Drive()
       return;
    }
    UpdateCyclePathTelemetry();
+   UpdateBreakevenLatch();
 
    const bool active_cycle = (g_position_count > 0 || g_order_count > 0 ||
                               g_cycle_id != 0 || HasOutstandingIntent() || HasTimedOutTombstone() ||
@@ -3846,6 +4052,14 @@ bool ValidateStaticConfiguration()
                   InpTakeProfitPips, min_stop_pips);
       return false;
    }
+   if(SingleLegMode() &&
+      (InpDirectionalTakeProfitPips <= min_stop_pips || InpDirectionalStopPips <= min_stop_pips))
+   {
+      PrintFormat("Initialization failed: directional TP %.2f / stop %.2f must exceed broker "
+                  "stop level %.2f pips.", InpDirectionalTakeProfitPips,
+                  InpDirectionalStopPips, min_stop_pips);
+      return false;
+   }
 
    // The flatten window must be nested inside the no-new-risk window. If it is
    // wider, P2 latches RESOLVE_FRIDAY and flattens, ClearCycleState() clears the
@@ -3865,6 +4079,11 @@ bool ValidateStaticConfiguration()
       InpSoftCycleLossGBP <= 0.0 || InpHardCycleLossGBP <= InpSoftCycleLossGBP ||
       InpEmergencySlippageReserveGBP < 0.0 || InpUnlinkedChargeReserveGBP < 0.0 ||
       InpEmergencySlippageReserveGBP + InpUnlinkedChargeReserveGBP >= InpHardCycleLossGBP ||
+      InpDirectionalTakeProfitPips <= 0.0 || InpSignalSpreadMaxPips <= 0.0 ||
+      InpMtfFastEmaPeriod < 1 || InpMtfSlowEmaPeriod <= InpMtfFastEmaPeriod ||
+      InpAtrPeriod < 2 || InpMinAtrPips < 0.0 || InpAtrExpansionRatio < 1.0 ||
+      InpBreakevenTriggerPips <= 0.0 || InpBreakevenOffsetPips < 0.0 ||
+      InpBreakevenTriggerPips >= InpDirectionalTakeProfitPips ||
       InpDirectionalStopPips <= 0.0 || InpMinSignalScore <= 0.0 ||
       InpMinVelocityPips100ms < 0.0 || InpSignalFastMs == 0 ||
       InpSignalSlowMs <= InpSignalFastMs || InpBreakoutWindowMs == 0 ||
@@ -3956,6 +4175,35 @@ int OnInit()
       PersistState();
    }
 
+   ArrayInitialize(g_reject_counts, 0);
+   if(SingleLegMode())
+   {
+      if(InpUseMtfConfirmation)
+      {
+         g_ema_fast_fast_handle = iMA(_Symbol, InpMtfFastTimeframe, InpMtfFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_slow_fast_handle = iMA(_Symbol, InpMtfFastTimeframe, InpMtfSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_fast_slow_handle = iMA(_Symbol, InpMtfSlowTimeframe, InpMtfFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         g_ema_slow_slow_handle = iMA(_Symbol, InpMtfSlowTimeframe, InpMtfSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_ema_fast_fast_handle == INVALID_HANDLE || g_ema_slow_fast_handle == INVALID_HANDLE ||
+            g_ema_fast_slow_handle == INVALID_HANDLE || g_ema_slow_slow_handle == INVALID_HANDLE)
+         {
+            PrintFormat("Initialization failed: EMA handle creation failed, error=%d", GetLastError());
+            ReleaseInstanceLease();
+            return INIT_FAILED;
+         }
+      }
+      if(InpUseVolatilityBurst)
+      {
+         g_atr_handle = iATR(_Symbol, InpAtrTimeframe, InpAtrPeriod);
+         if(g_atr_handle == INVALID_HANDLE)
+         {
+            PrintFormat("Initialization failed: ATR handle creation failed, error=%d", GetLastError());
+            ReleaseInstanceLease();
+            return INIT_FAILED;
+         }
+      }
+   }
+
    if(!EventSetMillisecondTimer((int)InpTimerPeriodMs))
    {
       PrintFormat("Millisecond timer unavailable, error=%d; attempting one-second safety timer", GetLastError());
@@ -3972,8 +4220,14 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   LogGateAttribution();
    PersistState();
    ReleaseInstanceLease();
+   if(g_ema_fast_fast_handle != INVALID_HANDLE) IndicatorRelease(g_ema_fast_fast_handle);
+   if(g_ema_slow_fast_handle != INVALID_HANDLE) IndicatorRelease(g_ema_slow_fast_handle);
+   if(g_ema_fast_slow_handle != INVALID_HANDLE) IndicatorRelease(g_ema_fast_slow_handle);
+   if(g_ema_slow_slow_handle != INVALID_HANDLE) IndicatorRelease(g_ema_slow_slow_handle);
+   if(g_atr_handle != INVALID_HANDLE)           IndicatorRelease(g_atr_handle);
    EventKillTimer();
    PrintFormat("EA deinitialized, reason=%d", reason);
 }
